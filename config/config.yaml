@@ -1,0 +1,16 @@
+Data:
+  groundtruth_path: './HCP2D/train/*/groundtruth_*.npy'
+  lowres_path: './HCP2D/train/*/lr_*.npy'
+  groundtruth_path_test: './HCP2D/test/*/groundtruth_*.npy'
+  lowres_path_test: './HCP2D/test/*/lr_*.npy'
+
+Train:
+  batch_size: 2
+  save_file: './results/train_loss.csv'
+  save_model: './results/model/checkpoint.pt'
+  save_last_model: './results/model/last_checkpoint.pt'
+
+Eval:
+  batch_size: 1
+  save_file: './results/valid_loss.csv'
+  save_imgs: './results/figures/'
