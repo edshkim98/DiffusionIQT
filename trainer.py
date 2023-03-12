@@ -17,7 +17,7 @@ from torch.cuda.amp import autocast, GradScaler
 
 import pytorch_warmup as warmup
 
-from imagen_pytorch import Imagen, NullUnet
+from imagen_pytorch3D import Imagen, NullUnet
 from elucidated_imagen import ElucidatedImagen
 from data import cycle
 
