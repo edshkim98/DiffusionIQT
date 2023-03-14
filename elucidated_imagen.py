@@ -18,7 +18,7 @@ import kornia.augmentation as K
 from einops import rearrange, repeat, reduce
 from einops_exts import rearrange_many
 
-from imagen_pytorch import (
+from imagen_pytorch3D import (
     GaussianDiffusionContinuousTimes,
     Unet,
     NullUnet,

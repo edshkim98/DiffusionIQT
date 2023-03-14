@@ -1,6 +1,7 @@
 import math
 import copy
 from random import random
+import numpy as np
 from beartype.typing import List, Union
 from beartype import beartype
 from tqdm.auto import tqdm
@@ -128,9 +129,10 @@ def l2norm(t):
 
 def right_pad_dims_to(x, t):
     padding_dims = x.ndim - t.ndim
+
     if padding_dims <= 0:
         return t
-    return t.view(*t.shape, *((1,) * padding_dims))
+    return t.view(*t.shape, *((1,) * padding_dims)) #bs c h w d
 
 def masked_mean(t, *, dim, mask = None):
     if not exists(mask):
@@ -264,7 +266,6 @@ class GaussianDiffusionContinuousTimes(nn.Module):
 
     def q_sample(self, x_start, t, noise = None):
         dtype = x_start.dtype
-
         if isinstance(t, float):
             batch = x_start.shape[0]
             t = torch.full((batch,), t, device = x_start.device, dtype = dtype)
@@ -1302,14 +1303,12 @@ class Unet(nn.Module):
             init_conv_residual = x.clone()
 
         # time conditioning
-
         time_hiddens = self.to_time_hiddens(time)
-
         # derive time tokens
 
         time_tokens = self.to_time_tokens(time_hiddens)
-        t = self.to_time_cond(time_hiddens)
 
+        t = self.to_time_cond(time_hiddens)
         # add lowres time conditioning to time hiddens
         # and add lowres time tokens along sequence dimension for attention
 
@@ -1395,7 +1394,9 @@ class Unet(nn.Module):
         if exists(lowres_cond_img):
             x = torch.cat((x, lowres_cond_img), dim = 1)
 
-        return self.final_conv(x)
+        out = self.final_conv(x)
+        
+        return out
 
 # null unet
 
@@ -1496,7 +1497,7 @@ class Imagen(nn.Module):
             loss_fn = F.smooth_l1_loss
         else:
             raise NotImplementedError()
-
+        self.flag = 0##################
         self.loss_type = loss_type
         self.loss_fn = loss_fn
 
@@ -2110,7 +2111,6 @@ class Imagen(nn.Module):
 #             lowres_cond_img_noisy, *_ = self.lowres_noise_schedule.q_sample(x_start = lowres_cond_img, t = lowres_aug_times, noise = torch.randn_like(lowres_cond_img))
 
         # time condition
-
         noise_cond = noise_scheduler.get_condition(times)
 
         # unet kwargs
@@ -2146,9 +2146,6 @@ class Imagen(nn.Module):
                 unet_kwargs = {**unet_kwargs, 'self_cond': x_start}
 
         # get prediction
-#         print(lowres_cond_img_noisy.shape)
-#         plt.imshow(lowres_cond_img_noisy.cpu()[0][0], cmap='gray')
-#         plt.show()
         pred = unet.forward(
             x_noisy,
             noise_cond,
@@ -2168,11 +2165,19 @@ class Imagen(nn.Module):
             target = alpha * noise - sigma * x_start
         else:
             raise ValueError(f'unknown objective {pred_objective}')
+        
+        with open('./results/pred'+'.npy', 'wb') as f:
+            np.save(f, pred.cpu().detach().numpy())
+        with open('./results/hr'+'.npy', 'wb') as f:
+            np.save(f, x_start.cpu().numpy())
+        with open('./results/target'+'.npy', 'wb') as f:
+            np.save(f, target.cpu().numpy())
 
+        self.flag+=1
         # losses
 
-        losses = self.loss_fn(pred, target, reduction = 'none')
-        losses = reduce(losses, 'b ... -> b', 'mean')
+        losses = self.loss_fn(pred, target, reduction = 'mean')
+        #losses = reduce(losses, 'b ... -> b', 'mean')
 
         # p2 loss reweighting
 
@@ -2223,8 +2228,7 @@ class Imagen(nn.Module):
         random_crop_size     = self.random_crop_sizes[unet_index]
         prev_image_size      = self.image_sizes[unet_index - 1] if unet_index > 0 else None
         
-
-        b, c, *_, h, w, device, is_video = *images.shape, images.device, images.ndim == 5
+        b, c, *_, h, w, d, device, is_video = *images.shape, images.device, images.ndim == 5
 
         check_shape(images, 'b c ...', c = self.channels)
         assert h >= target_image_size and w >= target_image_size

@@ -582,9 +582,9 @@ class ImagenTrainer(nn.Module):
     def add_valid_dataset(self, ds, *, batch_size, **dl_kwargs):
         if not exists(ds):
             return
-
+    
         assert not exists(self.valid_dl), 'validation dataloader was already added'
-        self.valid_batch_size = 1
+        self.valid_batch_size = batch_size
         dl = DataLoader(ds, batch_size = self.valid_batch_size, **dl_kwargs)
         self.add_valid_dataloader(dl)
 
@@ -621,14 +621,24 @@ class ImagenTrainer(nn.Module):
         self.create_valid_iter()
         ls = []
         preds = []
+        hrs = []
+        lrs = []
+        repeat = 20
         context = self.use_ema_unets if kwargs.pop('use_ema_unets', False) else nullcontext
         with context():
-            for i, data in enumerate(self.valid_dl):
-                images,outputs, lst = self.sample(batch_size = self.valid_batch_size, return_all_unet_outputs = True, return_pil_images = True, start_image_or_video = data[1].to(device), start_at_unet_number = 2)
-                loss = F.l1_loss(data[0], outputs[0].cpu())
-                preds.append(images)
-                ls.append(loss)
-        return np.array(ls), preds, data
+            # np.random.seed(42)
+            for rep in range(repeat):
+                for i, data in enumerate(self.valid_dl):
+                    outputs = self.sample(batch_size = self.valid_batch_size, return_all_unet_outputs = True, return_pil_images = False, start_image_or_video = data[1].to(device), start_at_unet_number = 2)
+                    loss = F.l1_loss(data[0], outputs[0].cpu())
+                    hrs.append(data[0].cpu())
+                    lrs.append(data[1].cpu())
+                    preds.append(outputs[0].cpu())
+                    ls.append(loss)
+        hrs = np.concatenate(hrs)
+        lrs = np.concatenate(lrs)
+        preds = np.concatenate(preds)
+        return np.array(ls), preds, [hrs,lrs]
 
     def step_with_dl_iter(self, dl_iter, **kwargs):
         #dl_tuple_output = cast_tuple(next(dl_iter))

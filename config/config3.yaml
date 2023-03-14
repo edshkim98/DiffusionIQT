@@ -1,0 +1,21 @@
+ProjectName: 'rtx2080ti'
+Results: './results/'
+Model: 'model/'
+File: 'train_log/'
+
+Data:
+  groundtruth_path: '/cluster/project0/IQT_Nigeria/skim/HCP_Harry_x4/train/*/T1w/*_groundtruth_norm.nii.gz'
+  lowres_path: '/cluster/project0/IQT_Nigeria/skim/HCP_Harry_x4/train/*/T1w/lr_norm*.gz'
+  groundtruth_path_test: '/cluster/project0/IQT_Nigeria/skim/HCP_Harry_x4/valid/*/T1w/*_groundtruth_norm.nii.gz'
+  lowres_path_test: '/cluster/project0/IQT_Nigeria/skim/HCP_Harry_x4/valid/*/T1w/lr_norm*.gz'
+
+Train:
+  batch_size: 1
+  save_file: 'train_loss.csv'
+  save_model: '3dimagen.pt'
+  save_last_model: 'last_checkpoint.pt'
+
+Eval:
+  batch_size: 2
+  save_file: 'valid_loss.csv'
+  save_imgs: 'figures/'

@@ -17,6 +17,8 @@ import torchvision.transforms as T
 from datasets.utils.file_utils import get_datasets_user_agent
 import io
 import urllib
+from torch.utils.data.dataloader import default_collate
+import nibabel as nib
 
 USER_AGENT = get_datasets_user_agent()
 
@@ -37,14 +39,109 @@ def convert_image_to(img_type, image):
 
 # dataset, dataloader, collator
 
+def my_collate(batch):
+    batch = list(filter(lambda x : x is not None, batch))
+    return default_collate(batch)
+
+class supervisedIQT(Dataset):
+    def __init__(self, lr_files, hr_files, fake=False, train=True):
+        self.lr_files = lr_files
+        self.hr_files = hr_files
+        self.patch_size = 32
+        self.fake = fake
+        self.ratio = 0.7
+        self.total_voxel = self.patch_size * self.patch_size * self.patch_size
+        self.train = train
+        self.is_transform = True
+
+        self.mean_lr = 35.493949511348724
+        self.std_lr = 37.11344433531084
+        self.files_lr = []
+        self.files_hr = []
+        
+        for i in range(len(self.lr_files)):
+            self.files_lr.append(self.lr_files[i])
+            self.files_hr.append(self.hr_files[i])
+
+    def __len__(self):
+        return len(self.files_lr)
+
+    def transform(self, image): # transform 3D array to tensor
+        
+        image_torch = torch.FloatTensor(image)
+        image_torch = (image_torch - self.mean_lr)/self.std_lr
+        
+        return image_torch
+    
+    def cube(self,data):
+
+        hyp_norm = data
+
+        if len(hyp_norm.shape)>3:
+            hyp_norm = hyp_norm[:,:, 2:258, 27:283]
+        else:
+            hyp_norm = hyp_norm[2:258, 27:283]
+
+        return hyp_norm
+
+    def __getitem__(self, idx):
+        
+        if self.fake:
+            self.lr = np.load(self.files_lr[idx])
+            self.hr = np.load(self.files_lr[idx].replace('lr','hr'))
+            self.lr = self.transform(self.lr)
+            self.hr = self.transform(self.hr)
+                
+            sample_lr = torch.unsqueeze(self.lr, 0)
+            sample_hr = torch.unsqueeze(self.hr, 0)
+            return sample_hr, sample_lr
+        self.lr = self.files_lr[idx]
+        self.hr = self.lr.replace('lr_norm','T1w_acpc_dc_restore_brain_sim036T_4x_groundtruth_norm')
+        
+        self.lr = nib.load(self.lr)
+        self.lr_affine = self.lr.affine
+        self.lr = torch.tensor(self.lr.get_fdata().astype(np.float32))
+        self.img_shape = self.lr.shape
+        self.hr = nib.load(self.hr)
+        self.hr_affine = self.hr.affine
+        self.hr = torch.tensor(self.hr.get_fdata().astype(np.float32))
+        
+        #Cube 
+        self.lr = self.cube(self.lr)
+        self.hr = self.cube(self.hr)
+            
+        random_idx = np.random.randint(low=0, high=256-self.patch_size+1, size=3)
+        self.lr = self.lr[random_idx[0]:random_idx[0]+self.patch_size, random_idx[1]:random_idx[1]+self.patch_size, random_idx[2]:random_idx[2]+self.patch_size]
+        self.hr = self.hr[random_idx[0]:random_idx[0]+self.patch_size, random_idx[1]:random_idx[1]+self.patch_size, random_idx[2]:random_idx[2]+self.patch_size]
+
+        non_zero = np.count_nonzero(self.lr)
+        non_zero_proportion = (non_zero/self.total_voxel)
+        if (non_zero_proportion < self.ratio):
+            return self.__getitem__(idx)
+                     
+        self.lr = self.transform(self.lr)
+        self.hr = self.transform(self.hr)
+            
+        sample_lr = torch.unsqueeze(self.lr, 0)
+        sample_hr = torch.unsqueeze(self.hr, 0)
+        
+        if self.train:
+            #fname = self.files_lr[idx].split('/')[6]
+            return sample_hr, sample_lr#, 'Index': idx, 'Affine': self.hr_affine}
+        else:
+            #fname = self.files_lr[idx].split('/')[7]
+            return sample_hr, sample_lr#, 'Index': idx, 'Affine': self.hr_affine}
+        
 class IQTDataset(Dataset):
     def __init__(
         self,
         hr_files,
-        lr_files
+        lr_files,
+        fake = False
     ):
         self.hrfiles = hr_files
         self.lrfiles = lr_files
+        self.fake = fake
         
         assert len(self.hrfiles) == len(self.hrfiles), "Length should be same"
     
@@ -73,19 +170,24 @@ class IQTDataset(Dataset):
         return len(self.hrfiles)
 
     def __getitem__(self, idx):
-        hrfile = self.hrfiles[idx]
-        lrfile = self.hrfiles[idx].replace('groundtruth_', 'lr_')
-        
-        hrimg = np.load(hrfile).astype(np.float32)
-        hrimg = self.np2tensor(hrimg, len(hrimg.shape))
-        hrimg = self.transform(hrimg)
-        hrimg = self.normalize(hrimg)
-        
-        lrimg = np.load(lrfile).astype(np.float32)
-        lrimg = self.np2tensor(lrimg, len(lrimg.shape))
-        lrimg = self.transform(lrimg)
-        lrimg = self.normalize(lrimg)
-        
+
+        if not self.fake:
+            hrfile = self.hrfiles[idx]
+            lrfile = self.hrfiles[idx].replace('groundtruth_', 'lr_')
+            
+            hrimg = np.load(hrfile).astype(np.float32)
+            hrimg = self.np2tensor(hrimg, len(hrimg.shape))
+            hrimg = self.transform(hrimg)
+            hrimg = self.normalize(hrimg)
+            
+            lrimg = np.load(lrfile).astype(np.float32)
+            lrimg = self.np2tensor(lrimg, len(lrimg.shape))
+            lrimg = self.transform(lrimg)
+            lrimg = self.normalize(lrimg)
+
+        else:
+            hrimg = torch.randn(1,32,32,32)
+            lrimg = torch.randn(1,32,32,32)    
         return hrimg, lrimg
     
 class Collator:

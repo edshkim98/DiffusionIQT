@@ -1288,13 +1288,12 @@ class Unet(nn.Module):
             init_conv_residual = x.clone()
 
         # time conditioning
-
         time_hiddens = self.to_time_hiddens(time)
-
         # derive time tokens
 
         time_tokens = self.to_time_tokens(time_hiddens)
         t = self.to_time_cond(time_hiddens)
+        
 
         # add lowres time conditioning to time hiddens
         # and add lowres time tokens along sequence dimension for attention
