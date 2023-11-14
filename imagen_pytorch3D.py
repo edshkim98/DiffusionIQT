@@ -1,3 +1,4 @@
+import sys
 import math
 import copy
 from random import random
@@ -7,14 +8,12 @@ from beartype import beartype
 from tqdm.auto import tqdm
 from functools import partial, wraps
 from contextlib import contextmanager, nullcontext
-from collections import namedtuple
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch import nn, einsum
-from torch.cuda.amp import autocast
 from torch.special import expm1
 import torchvision.transforms as T
 
@@ -24,12 +23,27 @@ from einops import rearrange, repeat, reduce, pack, unpack
 from einops.layers.torch import Rearrange, Reduce
 from einops_exts import rearrange_many, repeat_many, check_shape
 
-from t5 import t5_encode_text, get_encoded_dim, DEFAULT_T5_NAME
-
-from imagen_video import Unet3D, resize_video_to
+from imagen_video import Unet3D
+from utils_mine import convertVolume2subVolume, merge_sub_volumes, volume_to_slices
 import matplotlib.pyplot as plt
 
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+import torch.autograd
+from percept_loss import *
+
+torch.autograd.set_detect_anomaly(True)
 # helper functions
+
+def boundary_pad(img, batch_sample_factor=3):
+    b, c, h  = img.shape[0], img.shape[1], img.shape[2]
+    A = h+2
+    B = h
+    big_patch_size = h*batch_sample_factor
+    img = merge_sub_volumes(img, original_shape=(1,c,big_patch_size,big_patch_size,big_patch_size)) #1,C,96,96,96
+    img = F.pad(img, (1,1,1,1,1,1), "constant") #1,C,98,98,98
+    sub_volumes = img.unfold(2, A, B).unfold(3, A, B).unfold(4, A, B).permute(0,4,3,2,1,5,6,7).reshape(b, c, A, A, A)
+
+    return sub_volumes
 
 def exists(val):
     return val is not None
@@ -52,6 +66,9 @@ def maybe(fn):
             return x
         return fn(x)
     return inner
+
+def min_max_norm(img):
+    return (img-img.min())/(img.max()-img.min())
 
 def once(fn):
     called = False
@@ -132,6 +149,7 @@ def right_pad_dims_to(x, t):
 
     if padding_dims <= 0:
         return t
+    
     return t.view(*t.shape, *((1,) * padding_dims)) #bs c h w d
 
 def masked_mean(t, *, dim, mask = None):
@@ -230,10 +248,13 @@ class GaussianDiffusionContinuousTimes(nn.Module):
 
     def get_times(self, batch_size, noise_level, *, device):
         return torch.full((batch_size,), noise_level, device = device, dtype = torch.float32)
+        
 
     def sample_random_times(self, batch_size, *, device):
-        return torch.zeros((batch_size,), device = device).float().uniform_(0, 1)
-
+        random_tensor_cpu =  torch.zeros((batch_size,)).float().uniform_(0, 1)
+        random_tensor_gpu = random_tensor_cpu.to(device)
+        return random_tensor_gpu
+    
     def get_condition(self, times):
         return maybe(self.log_snr)(times)
 
@@ -243,8 +264,31 @@ class GaussianDiffusionContinuousTimes(nn.Module):
         times = torch.stack((times[:, :-1], times[:, 1:]), dim = 0)
         times = times.unbind(dim = -1)
         return times
+    
+    def get_sampling_timesteps_non_uniform(self, batch, *, device):
+        large_timesteps=10000
+        gamma = torch.tensor(10)
+        times = torch.linspace(1., 0., large_timesteps)
+
+        probs = torch.exp(-gamma * times).type(torch.float64)
+        probs = probs / probs.sum()
+
+        ts = torch.tensor(np.random.choice(times, self.num_timesteps, p=probs, replace=False))
+
+        if torch.tensor([1.0]) not in ts:
+            ts = torch.cat((ts, torch.tensor([1.0])))
+        if torch.tensor([0.0]) not in ts:
+            ts = torch.cat((ts, torch.tensor([0.0])))
+            
+        ts = torch.sort(ts,descending=True).values.to(device)
+        ts = repeat(ts, 't -> b t', b = batch)
+        ts = torch.stack((ts[:, :-1], ts[:, 1:]), dim = 0)
+        ts = ts.unbind(dim = -1)
+
+        return ts
 
     def q_posterior(self, x_start, x_t, t, *, t_next = None):
+        #Calculates predicted mean and variance for x_s given x_t. Here x_s is x_start (not necessarily x_T)
         t_next = default(t_next, lambda: (t - 1. / self.num_timesteps).clamp(min = 0.))
 
         """ https://openreview.net/attachment?id=2LdBqxc1Yv&name=supplementary_material """
@@ -305,7 +349,8 @@ class GaussianDiffusionContinuousTimes(nn.Module):
         alpha, sigma = log_snr_to_alpha_sigma(log_snr)
         return alpha * x_t - sigma * v
 
-    def predict_start_from_noise(self, x_t, t, noise):
+    def predict_start_from_noise(self, x_t, t, noise): 
+        #generate x_t-1 from x_t
         log_snr = self.log_snr(t)
         log_snr = right_pad_dims_to(x_t, log_snr)
         alpha, sigma = log_snr_to_alpha_sigma(log_snr)
@@ -330,10 +375,11 @@ class LayerNorm(nn.Module):
         eps = 1e-5 if x.dtype == torch.float32 else 1e-3
         var = torch.var(x, dim = dim, unbiased = False, keepdim = True)
         mean = torch.mean(x, dim = dim, keepdim = True)
+        # print(self.g.shape, mean.shape, var.shape, x.shape)
 
         return (x - mean) * (var + eps).rsqrt().type(dtype) * self.g.type(dtype)
 
-ChanLayerNorm = partial(LayerNorm, dim = -3)
+ChanLayerNorm = partial(LayerNorm, dim = -4) # h c h w d
 
 class Always():
     def __init__(self, val):
@@ -359,108 +405,6 @@ class Parallel(nn.Module):
         outputs = [fn(x) for fn in self.fns]
         return sum(outputs)
 
-# attention
-
-class Attention(nn.Module):
-    def __init__(
-        self,
-        dim,
-        *,
-        dim_head = 64,
-        heads = 8,
-        context_dim = None,
-        cosine_sim_attn = False
-    ):
-        super().__init__()
-        self.scale = dim_head ** -0.5 if not cosine_sim_attn else 1.
-        self.cosine_sim_attn = cosine_sim_attn
-        self.cosine_sim_scale = 16 if cosine_sim_attn else 1
-
-        self.heads = heads
-        inner_dim = dim_head * heads
-
-        self.norm = LayerNorm(dim)
-
-        self.null_kv = nn.Parameter(torch.randn(2, dim_head))
-        self.to_q = nn.Linear(dim, inner_dim, bias = False)
-        self.to_kv = nn.Linear(dim, dim_head * 2, bias = False)
-
-        self.to_context = nn.Sequential(nn.LayerNorm(context_dim), nn.Linear(context_dim, dim_head * 2)) if exists(context_dim) else None
-
-        self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, dim, bias = False),
-            LayerNorm(dim)
-        )
-
-    def forward(self, x, context = None, mask = None, attn_bias = None):
-        b, n, device = *x.shape[:2], x.device
-
-        x = self.norm(x)
-
-        q, k, v = (self.to_q(x), *self.to_kv(x).chunk(2, dim = -1))
-
-        q = rearrange(q, 'b n (h d) -> b h n d', h = self.heads)
-        q = q * self.scale
-
-        # add null key / value for classifier free guidance in prior net
-
-        nk, nv = repeat_many(self.null_kv.unbind(dim = -2), 'd -> b 1 d', b = b)
-        k = torch.cat((nk, k), dim = -2)
-        v = torch.cat((nv, v), dim = -2)
-
-        # add text conditioning, if present
-
-        if exists(context):
-            assert exists(self.to_context)
-            ck, cv = self.to_context(context).chunk(2, dim = -1)
-            k = torch.cat((ck, k), dim = -2)
-            v = torch.cat((cv, v), dim = -2)
-
-        # cosine sim attention
-
-        if self.cosine_sim_attn:
-            q, k = map(l2norm, (q, k))
-
-        # calculate query / key similarities
-
-        sim = einsum('b h i d, b j d -> b h i j', q, k) * self.cosine_sim_scale
-
-        # relative positional encoding (T5 style)
-
-        if exists(attn_bias):
-            sim = sim + attn_bias
-
-        # masking
-
-        max_neg_value = -torch.finfo(sim.dtype).max
-
-        if exists(mask):
-            mask = F.pad(mask, (1, 0), value = True)
-            mask = rearrange(mask, 'b j -> b 1 1 j')
-            sim = sim.masked_fill(~mask, max_neg_value)
-
-        # attention
-
-        attn = sim.softmax(dim = -1, dtype = torch.float32)
-        attn = attn.to(sim.dtype)
-
-        # aggregate values
-
-        out = einsum('b h i j, b j d -> b h i d', attn, v)
-
-        out = rearrange(out, 'b h n d -> b n (h d)')
-        return self.to_out(out)
-
-# decoder
-
-# def Upsample(dim, dim_out = None):
-#     dim_out = default(dim_out, dim)
-
-#     return nn.Sequential(
-#         nn.Upsample(scale_factor = 2, mode = 'nearest'),
-#         nn.Conv2d(dim, dim_out, 3, padding = 1)
-#     )
-
 def Upsample(dim, dim_out = None):
     dim_out = default(dim_out, dim)
 
@@ -470,16 +414,48 @@ def Upsample(dim, dim_out = None):
     )
 
 class PixelShuffle3D(nn.Module):
-    def __init__(self, r):
+    '''
+    This class is a 3d version of pixelshuffle.
+    '''
+    def __init__(self, scale):
+        '''
+        :param scale: upsample scale
+        '''
         super().__init__()
-        self.r = r
+        self.scale = scale
+
+    def forward(self, input):
+        batch_size, channels, in_depth, in_height, in_width = input.size()
+        nOut = channels // self.scale ** 3
+
+        out_depth = in_depth * self.scale
+        out_height = in_height * self.scale
+        out_width = in_width * self.scale
+
+        input_view = input.contiguous().view(batch_size, nOut, self.scale, self.scale, self.scale, in_depth, in_height, in_width)
+
+        output = input_view.permute(0, 1, 5, 2, 6, 3, 7, 4).contiguous()
+
+        return output.view(batch_size, nOut, out_depth, out_height, out_width)
+    
+class Deconv3D(nn.Module):
+
+    def __init__(self, inp_feat, out_feat, kernel=3, stride=2, padding=1):
+        super(Deconv3D, self).__init__()
+
+        self.deconv = nn.Sequential(
+            nn.ConvTranspose3d(inp_feat, out_feat, kernel_size=(kernel, kernel, kernel),
+                            stride=(stride, stride, stride), padding=(padding, padding, padding), output_padding=1, bias=True),
+            nn.Mish())
 
     def forward(self, x):
-        assert len(x.shape) == 5, "shape of input must be 3D (b, c, h, w, d)"
-        b, c, h, w, d = x.shape
-        x = x.reshape(b,c//(self.r**3),h*self.r,w*self.r,d*self.r)
-        return x
-    
+        return self.deconv(x)
+
+def Upsample_deconv(dim, dim_out = None):
+    dim_out = default(dim_out, dim)
+
+    return Deconv3D(dim, dim_out)
+
 class PixelShuffleUpsample(nn.Module):
     """
     code shared by @MalumaDev at DALLE2-pytorch for addressing checkboard artifacts
@@ -488,11 +464,11 @@ class PixelShuffleUpsample(nn.Module):
     def __init__(self, dim, dim_out = None):
         super().__init__()
         dim_out = default(dim_out, dim)
-        conv = nn.Conv3d(dim, dim_out * 8, 1)
+        conv = nn.Conv3d(dim, dim_out * 8, 1, padding_mode='replicate')
 
         self.net = nn.Sequential(
             conv,
-            nn.SiLU(),
+            nn.Mish(),
             PixelShuffle3D(2)
         )
 
@@ -517,6 +493,14 @@ def Downsample(dim, dim_out = None):
     return nn.Sequential(
         Rearrange('b c (h s1) (w s2) (d s3) -> b (c s1 s2 s3) h w d', s1 = 2, s2 = 2, s3 = 2),
         nn.Conv3d(dim * 8, dim_out, 1)
+    )
+
+def Downsample2(dim, dim_out = None):
+    # https://arxiv.org/abs/2208.03641 shows this is the most optimal way to downsample
+    # named SP-conv in the paper, but basically a pixel unshuffle
+    dim_out = default(dim_out, dim)
+    return nn.Sequential(
+        nn.Conv3d(dim, dim_out, 3, padding = 1, stride=2)
     )
 
 class SinusoidalPosEmb(nn.Module):
@@ -554,12 +538,19 @@ class Block(nn.Module):
         dim,
         dim_out,
         groups = 8,
-        norm = True
+        norm = True,
+        boundary = False,
+        factor = 3
     ):
         super().__init__()
         self.groupnorm = nn.GroupNorm(groups, dim) if norm else Identity()
-        self.activation = nn.SiLU()
-        self.project = nn.Conv3d(dim, dim_out, 3, padding = 1)
+        self.activation = nn.Mish()
+        self.boundary = boundary
+        self.factor = factor
+        if self.boundary:
+            self.project = nn.Conv3d(dim, dim_out, 3)
+        else:
+            self.project = nn.Conv3d(dim, dim_out, 3, padding = 1)
 
     def forward(self, x, scale_shift = None):
         x = self.groupnorm(x)
@@ -569,6 +560,9 @@ class Block(nn.Module):
             x = x * (scale + 1) + shift
 
         x = self.activation(x)
+        if self.boundary:
+            x = boundary_pad(x, batch_sample_factor=self.factor)
+
         return self.project(x)
 
 class ResnetBlock(nn.Module):
@@ -576,115 +570,67 @@ class ResnetBlock(nn.Module):
         self,
         dim,
         dim_out,
-        *,
-        cond_dim = None,
         time_cond_dim = None,
         groups = 8,
-        linear_attn = False,
-        use_gca = False,
-        squeeze_excite = False,
-        **attn_kwargs
+        use_se = False,
+        boundary = False,
+        factor = 3
     ):
         super().__init__()
 
         self.time_mlp = None
-
+        self.boundary = boundary
+        self.factor = factor
+                
         if exists(time_cond_dim):
             self.time_mlp = nn.Sequential(
-                nn.SiLU(),
+                nn.Mish(),
                 nn.Linear(time_cond_dim, dim_out * 2)
             )
 
 
-        self.block1 = Block(dim, dim_out, groups = groups)
-        self.block2 = Block(dim_out, dim_out, groups = groups)
+        self.block1 = Block(dim, dim_out, groups = groups, boundary=self.boundary, factor = self.factor)
+        self.block2 = Block(dim_out, dim_out, groups = groups, boundary=self.boundary, factor = self.factor)
 
-        self.gca = GlobalContext(dim_in = dim_out, dim_out = dim_out) if use_gca else Always(1)
+        self.se = SE3D(dim_out, reduction=16) if use_se else Identity()
 
         self.res_conv = nn.Conv3d(dim, dim_out, 1) if dim != dim_out else Identity()
 
 
-    def forward(self, x, time_emb = None, cond = None):
+    def forward(self, x, time_emb = None):
         scale_shift = None
         if exists(self.time_mlp) and exists(time_emb):
             time_emb = self.time_mlp(time_emb)
             time_emb = rearrange(time_emb, 'b c -> b c 1 1 1')
             scale_shift = time_emb.chunk(2, dim = 1)
-
+        
         h = self.block1(x)
         h = self.block2(h, scale_shift = scale_shift)
-        h = h * self.gca(h)
-        return h + self.res_conv(x)
+        #h = h * self.gca(h)
+        h = self.se(h)
+        
+        out = h + self.res_conv(x)
 
-class LinearAttention(nn.Module):
-    def __init__(
-        self,
-        dim,
-        dim_head = 32,
-        heads = 8,
-        dropout = 0.05,
-        context_dim = None,
-        **kwargs
-    ):
-        super().__init__()
-        self.scale = dim_head ** -0.5
-        self.heads = heads
-        inner_dim = dim_head * heads
-        self.norm = ChanLayerNorm(dim)
+        return out
 
-        self.nonlin = nn.SiLU()
 
-        self.to_q = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Conv2d(dim, inner_dim, 1, bias = False),
-            nn.Conv2d(inner_dim, inner_dim, 3, bias = False, padding = 1, groups = inner_dim)
+class SE3D(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(SE3D, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool3d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
         )
 
-        self.to_k = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Conv2d(dim, inner_dim, 1, bias = False),
-            nn.Conv2d(inner_dim, inner_dim, 3, bias = False, padding = 1, groups = inner_dim)
-        )
-
-        self.to_v = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Conv2d(dim, inner_dim, 1, bias = False),
-            nn.Conv2d(inner_dim, inner_dim, 3, bias = False, padding = 1, groups = inner_dim)
-        )
-
-        self.to_context = nn.Sequential(nn.LayerNorm(context_dim), nn.Linear(context_dim, inner_dim * 2, bias = False)) if exists(context_dim) else None
-
-        self.to_out = nn.Sequential(
-            nn.Conv2d(inner_dim, dim, 1, bias = False),
-            ChanLayerNorm(dim)
-        )
-
-    def forward(self, fmap, context = None):
-        h, x, y = self.heads, *fmap.shape[-2:]
-
-        fmap = self.norm(fmap)
-        q, k, v = map(lambda fn: fn(fmap), (self.to_q, self.to_k, self.to_v))
-        q, k, v = rearrange_many((q, k, v), 'b (h c) x y -> (b h) (x y) c', h = h)
-
-        if exists(context):
-            assert exists(self.to_context)
-            ck, cv = self.to_context(context).chunk(2, dim = -1)
-            ck, cv = rearrange_many((ck, cv), 'b n (h d) -> (b h) n d', h = h)
-            k = torch.cat((k, ck), dim = -2)
-            v = torch.cat((v, cv), dim = -2)
-
-        q = q.softmax(dim = -1)
-        k = k.softmax(dim = -2)
-
-        q = q * self.scale
-
-        context = einsum('b n d, b n e -> b d e', k, v)
-        out = einsum('b n d, b d e -> b n e', q, context)
-        out = rearrange(out, '(b h) (x y) d -> b (h d) x y', h = h, x = x, y = y)
-
-        out = self.nonlin(out)
-        return self.to_out(out)
-
+    def forward(self, x):
+        b, c, _, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1, 1)
+        return x * y.expand_as(x)
+    
 class GlobalContext(nn.Module):
     """ basically a superior form of squeeze-excitation that is attention-esque """
 
@@ -700,7 +646,7 @@ class GlobalContext(nn.Module):
 
         self.net = nn.Sequential(
             nn.Conv3d(dim_in, hidden_dim, 1),
-            nn.SiLU(),
+            nn.Mish(),
             nn.Conv3d(hidden_dim, dim_out, 1),
             nn.Sigmoid()
         )
@@ -711,86 +657,6 @@ class GlobalContext(nn.Module):
         out = einsum('b i n, b c n -> b c i', context.softmax(dim = -1), x)
         out = rearrange(out, '... -> ... 1 1')
         return self.net(out)
-
-def FeedForward(dim, mult = 2):
-    hidden_dim = int(dim * mult)
-    return nn.Sequential(
-        LayerNorm(dim),
-        nn.Linear(dim, hidden_dim, bias = False),
-        nn.GELU(),
-        LayerNorm(hidden_dim),
-        nn.Linear(hidden_dim, dim, bias = False)
-    )
-
-def ChanFeedForward(dim, mult = 2):  # in paper, it seems for self attention layers they did feedforwards with twice channel width
-    hidden_dim = int(dim * mult)
-    return nn.Sequential(
-        ChanLayerNorm(dim),
-        nn.Conv3d(dim, hidden_dim, 1, bias = False),
-        nn.GELU(),
-        ChanLayerNorm(hidden_dim),
-        nn.Conv3d(hidden_dim, dim, 1, bias = False)
-    )
-
-class TransformerBlock(nn.Module):
-    def __init__(
-        self,
-        dim,
-        *,
-        depth = 1,
-        heads = 8,
-        dim_head = 32,
-        ff_mult = 2,
-        context_dim = None,
-        cosine_sim_attn = False
-    ):
-        super().__init__()
-        self.layers = nn.ModuleList([])
-
-        for _ in range(depth):
-            self.layers.append(nn.ModuleList([
-                Attention(dim = dim, heads = heads, dim_head = dim_head, context_dim = context_dim, cosine_sim_attn = cosine_sim_attn),
-                FeedForward(dim = dim, mult = ff_mult)
-            ]))
-
-    def forward(self, x, context = None):
-        x = rearrange(x, 'b c h w d -> b h w d c')
-        x, ps = pack([x], 'b * c')
-
-        for attn, ff in self.layers:
-            x = attn(x, context = context) + x
-            x = ff(x) + x
-
-        x, = unpack(x, ps, 'b * c')
-        x = rearrange(x, 'b h w d c -> b c h w d')
-        return x
-
-class LinearAttentionTransformerBlock(nn.Module):
-    def __init__(
-        self,
-        dim,
-        *,
-        depth = 1,
-        heads = 8,
-        dim_head = 32,
-        ff_mult = 2,
-        context_dim = None,
-        **kwargs
-    ):
-        super().__init__()
-        self.layers = nn.ModuleList([])
-
-        for _ in range(depth):
-            self.layers.append(nn.ModuleList([
-                LinearAttention(dim = dim, heads = heads, dim_head = dim_head, context_dim = context_dim),
-                ChanFeedForward(dim = dim, mult = ff_mult)
-            ]))
-
-    def forward(self, x, context = None):
-        for attn, ff in self.layers:
-            x = attn(x, context = context) + x
-            x = ff(x) + x
-        return x
 
 class CrossEmbedLayer(nn.Module):
     def __init__(
@@ -853,19 +719,481 @@ class UpsampleCombiner(nn.Module):
         outs = [conv(fmap) for fmap, conv in zip(fmaps, self.fmap_convs)]
         return torch.cat((x, *outs), dim = 1)
 
+################################################################################################
+class TransformerEncoderBlock(nn.Module):
+    def __init__(self,
+                 emb_size: int = 256,
+                 num_heads: int = 8,
+                 dim_head: int = 64,
+                 drop_p: float = 0.,
+                 forward_expansion: int = 4,
+                 forward_drop_p: float = 0.0,
+                 patch_num: int = 4,
+                 local: bool=True):
+        super().__init__()
+        self.block = nn.Sequential(
+            ResidualAdd(nn.Sequential(
+                nn.LayerNorm(emb_size),
+                MultiHeadAttention(emb_size, num_heads = num_heads, dropout = drop_p, dim_head= dim_head),
+                nn.Dropout(drop_p)
+            )),
+            ResidualAdd(nn.Sequential(
+                nn.LayerNorm(emb_size),
+                FeedForwardBlock(
+                    emb_size, expansion=forward_expansion, drop_p=forward_drop_p, patch_num=patch_num, local=local),
+                nn.Dropout(drop_p)
+            ))
+        )
+    
+    def forward(self, x):
+        return self.block(x)
+        
+class TransformerEncoder(nn.Module):
+    def __init__(self, depth: int = 12, **kwargs):
+        super().__init__()
+        self.layers = nn.ModuleList([TransformerEncoderBlock(**kwargs) for _ in range(depth)])
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+class ResidualAdd(nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+        
+    def forward(self, x, **kwargs):
+        res = x
+        x = self.fn(x, **kwargs)
+        x += res
+        return x
+    
+    
+class FeedForwardBlock(nn.Sequential):
+    def __init__(self, emb_size: int, expansion: int = 4, drop_p: float = 0., patch_num: int = 4, local=False):
+        super().__init__()
+
+        if local:
+            self.up_proj = nn.Sequential(
+                                        Rearrange('b (h w d) c -> b c h w d', h=patch_num, w=patch_num, d=patch_num),
+                                        nn.Conv3d(emb_size, emb_size*expansion, kernel_size=1),
+                                        nn.Mish()
+                                        )
+            
+            self.depth_conv = nn.Sequential(
+                            depthwise_separable_conv3d(emb_size*expansion, emb_size*expansion, kernel_size=3, stride=1, padding=1),
+                            nn.Mish()
+                            )
+            
+            self.down_proj = nn.Sequential(
+                                        nn.Conv3d(emb_size*expansion, emb_size, kernel_size=1),
+                                        nn.Dropout(drop_p),
+                                        Rearrange('b c h w d ->b (h w d) c')
+                                        )
+            self.net = nn.Sequential(
+                self.up_proj,
+                self.depth_conv,
+                self.down_proj
+            )
+        else:
+            self.net = nn.Sequential(
+                nn.Linear(emb_size, expansion * emb_size),
+                nn.Mish(),
+                nn.Dropout(drop_p),
+                nn.Linear(expansion * emb_size, emb_size),
+            )
+
+    def forward(self, x):
+        return self.net(x)
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, emb_size: int = 128, num_heads: int = 8, dim_head: int = 64, dropout: float = 0):
+        super().__init__()
+
+        self.mid_emb_size = emb_size
+        self.emb_size = emb_size
+        self.dim_head = dim_head
+        self.num_heads = num_heads
+        self.inner_dim = dim_head * num_heads
+        self.qkv = nn.Linear(self.mid_emb_size , self.inner_dim* 3)
+        self.att_drop = nn.Dropout(dropout)
+        self.projection = nn.Linear(self.inner_dim , emb_size)
+        self.scaling = self.dim_head ** -0.5
+        
+    def forward(self, x, mask = None):
+        qkv = rearrange(self.qkv(x), "b n (h d qkv) -> qkv b h n d", h=self.num_heads, qkv=3)
+        queries, keys, values = qkv[0], qkv[1], qkv[2]
+        energy = torch.einsum('bhqd, bhkd -> bhqk', queries, keys) * self.scaling
+        if mask is not None:
+            fill_value = torch.finfo(torch.float32).min
+            energy.mask_fill(~mask, fill_value)
+            
+        att = F.softmax(energy, dim=-1) 
+        att = self.att_drop(att)
+        out = torch.einsum('bhal, bhlv -> bhav ', att, values)
+        out = rearrange(out, "b h n d -> b n (h d)")
+        out = self.projection(out)
+        return out
+
+
+class PatchEmbedding(nn.Module):
+    def __init__(self, in_channels: int = 3, patch_size: int = 4, emb_size: int = 128, img_size: int = 224, reduction: bool = False):
+        self.patch_size = patch_size
+        super().__init__()
+        
+        self.projection = nn.Sequential(
+            depthwise_separable_conv3d(in_channels, emb_size, kernel_size=patch_size, stride=patch_size), #nn.Conv3d(in_channels, emb_size, kernel_size=patch_size, stride=patch_size),
+            Rearrange('b e (h) (w) (d)-> b (h w d) e')
+        )
+
+        self.positions = nn.Parameter(torch.randn((img_size // patch_size) **3, emb_size))
+
+    def forward(self, x):
+        x = self.projection(x)
+        x += self.positions
+        return x
+
+class depthwise_separable_conv3d(nn.Module):
+    def __init__(self, input_dim, output_dim, kernel_size, stride, padding=0):
+        super(depthwise_separable_conv3d, self).__init__()
+        self.depthwise = nn.Conv3d(input_dim, input_dim, kernel_size=kernel_size, stride=stride, padding=padding,
+                                                              groups=input_dim)
+        self.pointwise = nn.Conv3d(input_dim, output_dim, kernel_size=1)
+
+    def forward(self, x):
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        
+        return x
+    
+class ViT3D(nn.Module):
+    def __init__(self,     
+                in_channels: int = 3,
+                patch_size: int = 16,
+                num_heads: int = 8,
+                dim_head: int = 64,
+                img_size: int = 224,
+                depth: int = 1,
+                drop_p: float = 0.1,
+                forward_drop_p: float = 0.3,
+                forward_expansion: int = 2,
+                reduction: bool = False, #VERSION reduction is deprecated and it refers to version of self attention
+                local: bool = True,
+                groups: int = 1,
+                **kwargs):
+        super().__init__()
+        self.reduction = reduction
+        self.emb_size = in_channels
+        self.patch_embedding = PatchEmbedding(in_channels, patch_size, self.emb_size, img_size, reduction=self.reduction)
+        self.transformer_encoder = TransformerEncoder(depth, emb_size=self.emb_size, num_heads=num_heads, dim_head=dim_head, patch_num=img_size//patch_size, drop_p = drop_p, forward_drop_p = forward_drop_p, forward_expansion = forward_expansion, local = local,**kwargs)
+
+        # self.reconstruction = nn.Sequential(
+        #     Rearrange('b (h w d) c ->b c (h w d)', h=img_size//patch_size, w=img_size//patch_size, d=img_size//patch_size),
+        #     nn.Conv1d(in_channels, in_channels * (patch_size ** 3), kernel_size=1, groups = groups),
+        #     Rearrange('b (c p1 p2 p3) (h w d) -> b c (h p1) (w p2) (d p3)', p1=patch_size, p2=patch_size, p3=patch_size, h=img_size//patch_size, w=img_size//patch_size, d=img_size//patch_size)
+        # )
+        self.reconstruction = nn.Sequential(
+                nn.LayerNorm(in_channels),
+                Rearrange('b (h w d) c ->b c h w d', h=img_size//patch_size, w=img_size//patch_size, d=img_size//patch_size),
+                nn.Upsample(scale_factor=patch_size, mode='trilinear', align_corners=True),
+                depthwise_separable_conv3d(in_channels, in_channels, kernel_size=3, stride=1, padding=1),
+                ChanLayerNorm(in_channels)
+        )
+
+    def forward(self, x):
+
+        x = self.patch_embedding(x)
+        x = self.transformer_encoder(x)
+        out = self.reconstruction(x)
+        return out
+#######################################################################################################################
+
+class Patchify(nn.Module):
+    def __init__(self, in_channels: int = 3, patch_size: int = 4, emb_size: int = 128, img_size: int = 224, reduction: bool = False):
+        self.patch_size = patch_size
+        super().__init__()
+        
+        self.norm = ChanLayerNorm(in_channels)
+        self.projection = depthwise_separable_conv3d(in_channels, emb_size, kernel_size=patch_size, stride=patch_size) #nn.Conv3d(in_channels, emb_size, kernel_size=patch_size, stride=patch_size),
+        
+    def forward(self, x):
+        x = self.norm(x)
+        x = self.projection(x)
+        return x
+    
+class LinearAttention(nn.Module):
+    def __init__(
+        self,
+        dim,
+        dim_head = 32,
+        heads = 8,
+        dropout = 0.05,
+        context_dim = None,
+        patch_size = 2, # it must be 4 times smaller than original patch (e.g. 2 for 8x8x8 patch)
+        img_size = 48,
+        patch = False,
+        groups = 1,
+        **kwargs
+    ):
+        super().__init__()
+        self.patch = patch
+        self.patch_size = patch_size
+        self.scale = dim_head ** -0.5
+        self.heads = heads
+        inner_dim = dim_head * heads
+        self.norm = ChanLayerNorm(dim)
+
+        self.nonlin = nn.Mish()
+
+        if self.patch:
+            self.patch_embed = Patchify(in_channels=dim, patch_size=patch_size, emb_size=dim, img_size=img_size) # H*C*W*C*D
+            self.reconstruct = nn.Sequential(
+                #nn.Conv3d(dim, dim*(patch_size ** 3), kernel_size=1, groups = groups),
+                nn.Upsample(scale_factor=patch_size, mode='trilinear', align_corners=True),
+                depthwise_separable_conv3d(dim, dim, kernel_size=3, stride=1, padding=1),
+                # Rearrange('b (c p1 p2 p3) h w d -> b c (h p1) (w p2) (d p3)', p1=patch_size, p2=patch_size, p3=patch_size, h=(img_size//patch_size), 
+                #           w=(img_size//patch_size), d=(img_size//patch_size)),
+                ChanLayerNorm(dim)
+            )
+        self.to_q = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Conv3d(dim, inner_dim, 1, bias = False),
+            nn.Conv3d(inner_dim, inner_dim, 3, bias = False, padding = 1, groups = inner_dim)
+        )
+
+        self.to_k = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Conv3d(dim, inner_dim, 1, bias = False),
+            nn.Conv3d(inner_dim, inner_dim, 3, bias = False, padding = 1, groups = inner_dim)
+        )
+
+        self.to_v = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Conv3d(dim, inner_dim, 1, bias = False),
+            nn.Conv3d(inner_dim, inner_dim, 3, bias = False, padding = 1, groups = inner_dim)
+        )
+
+        self.to_context = nn.Sequential(nn.LayerNorm(context_dim), nn.Linear(context_dim, inner_dim * 2, bias = False)) if exists(context_dim) else None
+
+        self.to_out = nn.Sequential(
+            nn.Conv3d(inner_dim, dim, 1, bias = False),
+            ChanLayerNorm(dim)
+        )
+
+    def forward(self, fmap, context = None):
+
+        if self.patch:
+            fmap = self.patch_embed(fmap)
+
+        h, x, y, z= self.heads, *fmap.shape[-3:]
+
+        fmap = self.norm(fmap)
+        q, k, v = map(lambda fn: fn(fmap), (self.to_q, self.to_k, self.to_v))
+        q, k, v = rearrange_many((q, k, v), 'b (h c) x y z-> (b h) (x y z) c', h = h)
+
+        if exists(context):
+            assert exists(self.to_context)
+            ck, cv = self.to_context(context).chunk(2, dim = -1)
+            ck, cv = rearrange_many((ck, cv), 'b n (h d) -> (b h) n d', h = h)
+            k = torch.cat((k, ck), dim = -2)
+            v = torch.cat((v, cv), dim = -2)
+
+        q = q.softmax(dim = -1)
+        k = k.softmax(dim = -2)
+
+        q = q * self.scale
+
+        context = einsum('b n d, b n e -> b d e', k, v)
+        out = einsum('b n d, b d e -> b n e', q, context)
+        out = rearrange(out, '(b h) (x y z) d -> b (h d) x y z', h = h, x = x, y = y, z=z)
+
+        out = self.nonlin(out)
+        out =  self.to_out(out)
+        if self.patch:
+            out = self.reconstruct(out)
+        return out
+
+class SoftMaxAttention(nn.Module):
+    def __init__(
+        self,
+        dim,
+        dim_head = 32,
+        heads = 8,
+        dropout = 0.05,
+        context_dim = None,
+        patch_size = 2, # it must be 4 times smaller than original patch (e.g. 2 for 8x8x8 patch)
+        img_size = 48,
+        patch = False,
+        groups = 1,
+        **kwargs
+    ):
+        super().__init__()
+        self.patch = patch
+        self.patch_size = patch_size
+        self.scale = dim_head ** -0.5
+        self.heads = heads
+        inner_dim = dim_head * heads
+        self.norm = ChanLayerNorm(dim)
+
+        self.nonlin = nn.Mish()
+
+        if self.patch:
+            self.patch_embed = Patchify(in_channels=dim, patch_size=patch_size, emb_size=dim, img_size=img_size) # H*C*W*C*D
+            self.reconstruct = nn.Sequential(
+                #nn.Conv3d(dim, dim*(patch_size ** 3), kernel_size=1, groups = groups),
+                nn.Upsample(scale_factor=patch_size, mode='trilinear', align_corners=True),
+                depthwise_separable_conv3d(dim, dim, kernel_size=3, stride=1, padding=1),
+                # Rearrange('b (c p1 p2 p3) h w d -> b c (h p1) (w p2) (d p3)', p1=patch_size, p2=patch_size, p3=patch_size, h=(img_size//patch_size), 
+                #           w=(img_size//patch_size), d=(img_size//patch_size)),
+                ChanLayerNorm(dim)
+            )
+        self.to_q = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Conv3d(dim, inner_dim, 1, bias = False),
+            nn.Conv3d(inner_dim, inner_dim, 3, bias = False, padding = 1, groups = inner_dim)
+        )
+
+        self.to_k = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Conv3d(dim, inner_dim, 1, bias = False),
+            nn.Conv3d(inner_dim, inner_dim, 3, bias = False, padding = 1, groups = inner_dim)
+        )
+
+        self.to_v = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Conv3d(dim, inner_dim, 1, bias = False),
+            nn.Conv3d(inner_dim, inner_dim, 3, bias = False, padding = 1, groups = inner_dim)
+        )
+
+        self.to_context = nn.Sequential(nn.LayerNorm(context_dim), nn.Linear(context_dim, inner_dim * 2, bias = False)) if exists(context_dim) else None
+
+        self.to_out = nn.Sequential(
+            nn.Conv3d(inner_dim, dim, 1, bias = False),
+            ChanLayerNorm(dim)
+        )
+    
+    def forward(self, fmap, context = None):
+
+        if self.patch:
+            fmap = self.patch_embed(fmap)
+
+        h, x, y, z= self.heads, *fmap.shape[-3:]
+
+        fmap = self.norm(fmap)
+        q, k, v = map(lambda fn: fn(fmap), (self.to_q, self.to_k, self.to_v))
+        q, k, v = rearrange_many((q, k, v), 'b (h c) x y z-> (b h) (x y z) c', h = h)
+
+        energy = torch.einsum('bqd, bkd -> bqk', q, k) * self.scale
+
+        if exists(context):
+            assert exists(self.to_context)
+            ck, cv = self.to_context(context).chunk(2, dim = -1)
+            ck, cv = rearrange_many((ck, cv), 'b n (h d) -> (b h) n d', h = h)
+            k = torch.cat((k, ck), dim = -2)
+            v = torch.cat((v, cv), dim = -2)
+
+        att = F.softmax(energy, dim=-1) 
+
+        out = einsum('b n d, b d e -> b n e', att, v)
+        out = rearrange(out, '(b h) (x y z) d -> b (h d) x y z', h = h, x = x, y = y, z=z)
+
+        out = self.nonlin(out)
+        out =  self.to_out(out)
+        if self.patch:
+            out = self.reconstruct(out)
+        return out
+    
+def ChanFeedForward(dim, mult = 2):  # in paper, it seems for self attention layers they did feedforwards with twice channel width
+    hidden_dim = int(dim * mult)
+    return nn.Sequential(
+        ChanLayerNorm(dim),
+        nn.Conv3d(dim, hidden_dim, 1, bias = False),
+        nn.GELU(),
+        ChanLayerNorm(hidden_dim),
+        nn.Conv3d(hidden_dim, dim, 1, bias = False)
+    )
+
+class LinearAttentionTransformerBlock(nn.Module):
+    def __init__(
+        self,
+        dim,
+        *,
+        depth = 1,
+        heads = 8,
+        dim_head = 32,
+        ff_mult = 2,
+        context_dim = None,
+        patch_size = 2,
+        img_size = 48,
+        patch = False,
+        groups = 1,
+        **kwargs
+    ):
+        super().__init__()
+        self.layers = nn.ModuleList([])
+        self.patch = patch
+        self.img_size = img_size
+
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                LinearAttention(dim = dim, heads = heads, dim_head = dim_head, context_dim = context_dim, patch_size = patch_size, img_size= self.img_size,
+                                patch = self.patch, groups = groups),
+                ChanFeedForward(dim = dim, mult = ff_mult)
+            ]))
+
+    def forward(self, x, context = None):
+        for attn, ff in self.layers:
+            x = attn(x, context = context) + x
+            x = ff(x) + x
+        
+        return x
+    
+class SoftMaxAttentionTransformerBlock(nn.Module):
+    def __init__(
+        self,
+        dim,
+        *,
+        depth = 1,
+        heads = 8,
+        dim_head = 32,
+        ff_mult = 2,
+        context_dim = None,
+        patch_size = 2,
+        img_size = 48,
+        patch = False,
+        groups = 1,
+        **kwargs
+    ):
+        super().__init__()
+        self.layers = nn.ModuleList([])
+        self.patch = patch
+        self.img_size = img_size
+
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                SoftMaxAttention(dim = dim, heads = heads, dim_head = dim_head, context_dim = context_dim, patch_size = patch_size, img_size= self.img_size,
+                                patch = self.patch, groups = groups),
+                ChanFeedForward(dim = dim, mult = ff_mult)
+            ]))
+
+    def forward(self, x, context = None):
+        for attn, ff in self.layers:
+            x = attn(x, context = context) + x
+            x = ff(x) + x
+        
+        return x
+
 class Unet(nn.Module):
     def __init__(
         self,
         *,
         dim,
-        image_embed_dim = 1024,
-        text_embed_dim = get_encoded_dim(DEFAULT_T5_NAME),
+        img_size = 96,
         num_resnet_blocks = 1,
         cond_dim = None,
-        num_image_tokens = 4,
-        num_time_tokens = 2,
         learned_sinu_pos_emb_dim = 16,
-        out_dim = None,
         dim_mults=(1, 2, 4, 8),
         cond_images_channels = 0,
         channels = 3,
@@ -874,41 +1202,57 @@ class Unet(nn.Module):
         attn_heads = 8,
         ff_mult = 2.,
         lowres_cond = False,                # for cascading diffusion - https://cascaded-diffusion.github.io/
-        layer_attns = True,
-        layer_attns_depth = 1,
-        layer_mid_attns_depth = 1,
-        layer_attns_add_text_cond = True,   # whether to condition the self-attention blocks with the text embeddings, as described in Appendix D.3.1
+        att_type = 'vit',
         attend_at_middle = True,            # whether to have a layer of attention at the bottleneck (can turn off for higher resolution in cascading DDPM, before bringing in efficient attention)
-        layer_cross_attns = True,
-        use_linear_attn = False,
-        use_linear_cross_attn = False,
-        cond_on_text = True,
-        max_text_len = 256,
-        init_dim = None,
+        attend_at_middle_depth = 1,
+        attend_at_middle_heads = 8,
+        attend_at_enc = True,
+        attend_at_enc_depth = 1,
+        attend_at_enc_heads = 8,
+        att_drop = 0.1,
+        att_forward_drop = 0.3,
+        att_forward_expansion = 2,
+        att_skip_scale = False,
+        att_localvit = True,
+        groups = 1,
+        emb_size = 768,
+        init_dim = 32,
         resnet_groups = 8,
-        init_conv_kernel_size = 7,          # kernel size of initial conv, if not using cross embed
+        init_conv_kernel_size = 3,          # kernel size of initial conv, if not using cross embed
         init_cross_embed = True,
         init_cross_embed_kernel_sizes = (3, 7, 15),
         cross_embed_downsample = False,
         cross_embed_downsample_kernel_sizes = (2, 4),
-        attn_pool_text = False,
-        attn_pool_num_latents = 32,
-        dropout = 0.,
         memory_efficient = False,
         init_conv_to_final_conv_residual = False,
-        use_global_context_attn = True,
-        scale_skip_connection = True,
+        use_se_attn = True,
+        scale_skip_connection = False,
         final_resnet_block = True,
-        final_conv_kernel_size = 3,
-        cosine_sim_attn = False,
+        final_conv_kernel_size = 1,
         self_cond = False,
         combine_upsample_fmaps = False,      # combine feature maps from all upsample blocks, used in unet squared successfully
         pixel_shuffle_upsample = True,       # may address checkboard artifacts
-    ):
+        boundary = False,
+        batch_sample = True,
+        batch_sample_factor = 3,
+        deep_feature = True
+            ):
         super().__init__()
 
         # guide researchers
-
+        self.att_type = att_type
+        self.dim_head = attn_dim_head
+        self.att_localvit = att_localvit
+        self.skip_scale = att_skip_scale
+        self.batch_sample = batch_sample
+        self.att_drop = att_drop
+        self.att_forward_drop = att_forward_drop
+        self.att_forward_expansion = att_forward_expansion
+        self.img_size = img_size
+        self.batch_sample_factor = batch_sample_factor
+        self.boundary = boundary
+        self.num_groups = groups
+        self.deep_feature = deep_feature
         assert attn_heads > 1, 'you need to have more than 1 attention head, ideally at least 4 or 8'
 
         if dim < 128:
@@ -919,7 +1263,7 @@ class Unet(nn.Module):
         self._locals = locals()
         self._locals.pop('self', None)
         self._locals.pop('__class__', None)
-
+               
         # determine dimensions
 
         self.channels = channels
@@ -927,7 +1271,7 @@ class Unet(nn.Module):
 
         # (1) in cascading diffusion, one concats the low resolution image, blurred, for conditioning the higher resolution synthesis
         # (2) in self conditioning, one appends the predict x0 (x_start)
-        init_channels = channels * (1 + int(lowres_cond) + int(self_cond))
+        init_channels = channels * (1 + int(lowres_cond))
         init_dim = default(init_dim, dim)
 
         self.self_cond = self_cond
@@ -941,15 +1285,20 @@ class Unet(nn.Module):
 
         # initial convolution
 
-        self.init_conv = CrossEmbedLayer(init_channels, dim_out = init_dim, kernel_sizes = init_cross_embed_kernel_sizes, stride = 1) if init_cross_embed else nn.Conv3d(init_channels, init_dim, init_conv_kernel_size, padding = init_conv_kernel_size // 2)
+        if self.boundary:
+            self.init_conv = CrossEmbedLayer(init_channels, dim_out = init_dim, kernel_sizes = init_cross_embed_kernel_sizes, stride = 1) if init_cross_embed else nn.Conv3d(init_channels, init_dim, init_conv_kernel_size)
+        else:
+            self.init_conv = CrossEmbedLayer(init_channels, dim_out = init_dim, kernel_sizes = init_cross_embed_kernel_sizes, stride = 1) if init_cross_embed else nn.Conv3d(init_channels, init_dim, init_conv_kernel_size, padding = init_conv_kernel_size // 2)
 
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
+        self.dims = dims
+        self.in_out = in_out
 
         # time conditioning
 
-        cond_dim = default(cond_dim, dim)
-        time_cond_dim = dim * 4 * (1 if lowres_cond else 1) ####################################################
+        cond_dim = default(cond_dim, dim) #64
+        time_cond_dim = dim * 4 #64*4=256
 
         # embedding time for log(snr) noise from continuous version
 
@@ -959,103 +1308,38 @@ class Unet(nn.Module):
         self.to_time_hiddens = nn.Sequential(
             sinu_pos_emb,
             nn.Linear(sinu_pos_emb_input_dim, time_cond_dim),
-            nn.SiLU()
+            nn.Mish()
         )
 
         self.to_time_cond = nn.Sequential(
             nn.Linear(time_cond_dim, time_cond_dim)
         )
 
-        # project to time tokens as well as time hiddens
-
-        self.to_time_tokens = nn.Sequential(
-            nn.Linear(time_cond_dim, cond_dim * num_time_tokens),
-            Rearrange('b (r d) -> b r d', r = num_time_tokens)
-        )
-
         # low res aug noise conditioning
-
         self.lowres_cond = lowres_cond
 
-        if lowres_cond:
-            self.to_lowres_time_hiddens = nn.Sequential(
-                LearnedSinusoidalPosEmb(learned_sinu_pos_emb_dim),
-                nn.Linear(learned_sinu_pos_emb_dim + 1, time_cond_dim),
-                nn.SiLU()
-            )
-
-            self.to_lowres_time_cond = nn.Sequential(
-                nn.Linear(time_cond_dim, time_cond_dim)
-            )
-
-            self.to_lowres_time_tokens = nn.Sequential(
-                nn.Linear(time_cond_dim, cond_dim * num_time_tokens),
-                Rearrange('b (r d) -> b r d', r = num_time_tokens)
-            )
-
         # normalizations
-
         self.norm_cond = nn.LayerNorm(cond_dim)
 
         # text encoding conditioning (optional)
-
         self.text_to_cond = None
-
-        # finer control over whether to condition on text encodings
-
-        self.cond_on_text = cond_on_text
-
-        # for classifier free guidance
-
-        self.max_text_len = max_text_len
-
-        self.null_text_embed = nn.Parameter(torch.randn(1, max_text_len, cond_dim))
-        self.null_text_hidden = nn.Parameter(torch.randn(1, time_cond_dim))
-
-        # for non-attention based text conditioning at all points in the network where time is also conditioned
-
-        self.to_text_non_attn_cond = None
-
-        if cond_on_text:
-            self.to_text_non_attn_cond = nn.Sequential(
-                nn.LayerNorm(cond_dim),
-                nn.Linear(cond_dim, time_cond_dim),
-                nn.SiLU(),
-                nn.Linear(time_cond_dim, time_cond_dim)
-            )
-
-        # attention related params
-
-        attn_kwargs = dict(heads = attn_heads, dim_head = attn_dim_head, cosine_sim_attn = cosine_sim_attn)
 
         num_layers = len(in_out)
 
         # resnet block klass
 
-        num_resnet_blocks = cast_tuple(num_resnet_blocks, num_layers)
-        resnet_groups = cast_tuple(resnet_groups, num_layers)
+        num_resnet_blocks = cast_tuple(num_resnet_blocks, num_layers) #(2,2,2)
+        resnet_groups = cast_tuple(resnet_groups, num_layers) #(8,8,8)
 
-        resnet_klass = partial(ResnetBlock, **attn_kwargs)
+        resnet_klass = ResnetBlock
 
-        layer_attns = cast_tuple(layer_attns, num_layers)
-        layer_attns_depth = cast_tuple(layer_attns_depth, num_layers)
-        layer_cross_attns = cast_tuple(layer_cross_attns, num_layers)
-
-        use_linear_attn = cast_tuple(use_linear_attn, num_layers)
-        use_linear_cross_attn = cast_tuple(use_linear_cross_attn, num_layers)
-
-        assert all([layers == num_layers for layers in list(map(len, (resnet_groups, layer_attns, layer_cross_attns)))])
-
+        assert len(resnet_groups) == num_layers, 'number of resnet groups must be equal to number of layers'
         # downsample klass
 
         downsample_klass = Downsample
 
         if cross_embed_downsample:
             downsample_klass = partial(CrossEmbedLayer, kernel_sizes = cross_embed_downsample_kernel_sizes)
-
-        # initial resnet block (for memory efficient unet)
-
-        self.init_resnet_block = resnet_klass(init_dim, init_dim, time_cond_dim = time_cond_dim, groups = resnet_groups[0], use_gca = use_global_context_attn) if memory_efficient else None
 
         # scale for resnet skip connections
 
@@ -1067,24 +1351,17 @@ class Unet(nn.Module):
         self.ups = nn.ModuleList([])
         num_resolutions = len(in_out)
 
-        layer_params = [num_resnet_blocks, resnet_groups, layer_attns, layer_attns_depth, layer_cross_attns, use_linear_attn, use_linear_cross_attn]
+        layer_params = [num_resnet_blocks, resnet_groups]
         reversed_layer_params = list(map(reversed, layer_params))
 
         # downsampling layers
 
         skip_connect_dims = [] # keep track of skip connection dimensions
+        img_sizes = []
+        self.patch_size = 8 ########################################### 48 -> 16 -> 4
 
-        for ind, ((dim_in, dim_out), layer_num_resnet_blocks, groups, layer_attn, layer_attn_depth, layer_cross_attn, layer_use_linear_attn, layer_use_linear_cross_attn) in enumerate(zip(in_out, *layer_params)):
+        for ind, ((dim_in, dim_out), layer_num_resnet_blocks, groups) in enumerate(zip(in_out, *layer_params)):
             is_last = ind >= (num_resolutions - 1)
-
-            layer_cond_dim = cond_dim if layer_cross_attn or layer_use_linear_cross_attn else None
-
-            if layer_attn:
-                transformer_block_klass = TransformerBlock
-            elif layer_use_linear_attn:
-                transformer_block_klass = LinearAttentionTransformerBlock
-            else:
-                transformer_block_klass = Identity
 
             current_dim = dim_in
 
@@ -1095,111 +1372,129 @@ class Unet(nn.Module):
             if memory_efficient:
                 pre_downsample = downsample_klass(dim_in, dim_out)
                 current_dim = dim_out
+            
+            img_sizes.append(self.img_size)
 
-            skip_connect_dims.append(current_dim)
+            # self.patch_size = self.img_size//3//2 ########################################### 48 -> 16 -> 4
+            self.img_size_transformer = img_sizes[-1]
+
+            if ind != len(in_out)-1:
+                skip_connect_dims.append(current_dim)
 
             # whether to do post-downsample, for non-memory efficient unet
 
             post_downsample = None
             if not memory_efficient:
-                post_downsample = downsample_klass(current_dim, dim_out) if not is_last else Parallel(nn.Conv3d(dim_in, dim_out, 3, padding = 1), nn.Conv3d(dim_in, dim_out, 1))
+                post_downsample = downsample_klass(current_dim, dim_out) if not is_last else nn.Conv3d(current_dim, dim_out, 1) 
+            else:
+                post_downsample = nn.Conv3d(dim_out, dim_out, 1)
+            
+            if attend_at_enc[ind]:
+                if self.att_type == 'vit':
+                    transformer_enc = ViT3D(in_channels=current_dim, patch_size=self.patch_size, num_heads=attend_at_enc_heads[ind], dim_head = self.dim_head, img_size=self.img_size_transformer, depth=attend_at_enc_depth[ind], 
+                                        forward_drop_p=self.att_forward_drop, drop_p=self.att_drop, forward_expansion = self.att_forward_expansion, reduction=False, local=self.att_localvit, groups=self.num_groups) 
+                elif self.att_type == 'linear':
+                    transformer_enc = LinearAttentionTransformerBlock(dim = current_dim, depth = attend_at_enc_depth[ind], heads = attend_at_enc_heads[ind], dim_head = self.dim_head, ff_mult = self.att_forward_expansion
+                                                                    , patch_size = self.patch_size, img_size= self.img_size_transformer, patch = True, groups = self.num_groups) 
+                else:
+                    transformer_enc = SoftMaxAttentionTransformerBlock(dim = current_dim, depth = attend_at_enc_depth[ind], heads = attend_at_enc_heads[ind], dim_head = self.dim_head, ff_mult = self.att_forward_expansion
+                                                                    , patch_size = self.patch_size, img_size= self.img_size_transformer, patch = True, groups = self.num_groups) 
+            else:
+                transformer_enc = None
 
             self.downs.append(nn.ModuleList([
                 pre_downsample,
-                resnet_klass(current_dim, current_dim, cond_dim = layer_cond_dim, linear_attn = layer_use_linear_cross_attn, time_cond_dim = time_cond_dim, groups = groups),
-                nn.ModuleList([ResnetBlock(current_dim, current_dim, time_cond_dim = time_cond_dim, groups = groups, use_gca = use_global_context_attn) for _ in range(layer_num_resnet_blocks)]),
-                transformer_block_klass(dim = current_dim, depth = layer_attn_depth, ff_mult = ff_mult, context_dim = cond_dim, **attn_kwargs),
+                ResnetBlock(current_dim, current_dim, time_cond_dim = time_cond_dim, groups = groups, use_se = use_se_attn, boundary= self.boundary, factor = self.batch_sample_factor),
+                transformer_enc,
+                nn.ModuleList([ResnetBlock(current_dim, current_dim, time_cond_dim = time_cond_dim, groups = groups, use_se = use_se_attn, boundary= self.boundary, factor = self.batch_sample_factor) for _ in range(layer_num_resnet_blocks)]),
                 post_downsample
             ]))
-
+            self.img_size = self.img_size //2
+            if not is_last:
+                self.patch_size = self.patch_size //2
         # middle layers
-
-        mid_dim = dims[-1]
-
-        self.mid_block1 = ResnetBlock(mid_dim, mid_dim, cond_dim = cond_dim, time_cond_dim = time_cond_dim, groups = resnet_groups[-1])
-        self.mid_attn = TransformerBlock(mid_dim, depth = layer_mid_attns_depth, **attn_kwargs) if attend_at_middle else None
-        self.mid_block2 = ResnetBlock(mid_dim, mid_dim, cond_dim = cond_dim, time_cond_dim = time_cond_dim, groups = resnet_groups[-1])
-
+        
+        if self.deep_feature:
+            if attend_at_middle:
+                mid_dim = dims[-1] 
+            else:
+                mid_dim = dims[-1]
+            if self.att_type == 'linear':
+                self.mid_attn = LinearAttentionTransformerBlock(dim = mid_dim, depth = attend_at_middle_depth, heads = attend_at_middle_heads, dim_head = self.dim_head,
+                                                             ff_mult = self.att_forward_expansion, patch_size = self.patch_size, img_size= img_sizes[-1], patch = True, groups = self.num_groups) if attend_at_middle else None
+            elif self.att_type == 'softmax':
+                self.mid_attn = SoftMaxAttentionTransformerBlock(dim = mid_dim, depth = attend_at_middle_depth, heads = attend_at_middle_heads, dim_head = self.dim_head,
+                                                             ff_mult = self.att_forward_expansion, patch_size = self.patch_size, img_size= img_sizes[-1], patch = True, groups = self.num_groups) if attend_at_middle else None
+            else:
+                self.mid_attn = ViT3D(in_channels=mid_dim, patch_size=self.patch_size, num_heads=attend_at_middle_heads, dim_head = self.dim_head, img_size=img_sizes[-1],
+                                   depth=attend_at_middle_depth, forward_drop_p=self.att_forward_drop, drop_p=self.att_drop, forward_expansion=self.att_forward_expansion, reduction=False, local=self.att_localvit, groups=self.num_groups) if attend_at_middle else None 
+            self.mid_block = ResnetBlock(mid_dim, mid_dim, time_cond_dim = time_cond_dim, groups = resnet_groups[-1], boundary= self.boundary, factor = self.batch_sample_factor)
+        else:
+            mid_dim = dims[-1] 
+            self.mid_block = ResnetBlock(mid_dim, mid_dim, time_cond_dim = time_cond_dim, groups = resnet_groups[-1], boundary= self.boundary, factor = self.batch_sample_factor)
         # upsample klass
 
-        upsample_klass = Upsample if not pixel_shuffle_upsample else PixelShuffleUpsample
+        upsample_klass = Upsample_deconv if not pixel_shuffle_upsample else PixelShuffleUpsample
 
         # upsampling layers
 
         upsample_fmap_dims = []
-
-        for ind, ((dim_in, dim_out), layer_num_resnet_blocks, groups, layer_attn, layer_attn_depth, layer_cross_attn, layer_use_linear_attn, layer_use_linear_cross_attn) in enumerate(zip(reversed(in_out), *reversed_layer_params)):
+        for ind, ((dim_out, dim_in), layer_num_resnet_blocks, groups) in enumerate(zip(reversed(in_out), *reversed_layer_params)):
+            if ind == 0:
+                dim_in = mid_dim
             is_last = ind == (len(in_out) - 1)
 
-            layer_cond_dim = cond_dim if layer_cross_attn or layer_use_linear_cross_attn else None
+            if not is_last:
+                skip_connect_dim = skip_connect_dims.pop()
 
-            if layer_attn:
-                transformer_block_klass = TransformerBlock
-            elif layer_use_linear_attn:
-                transformer_block_klass = LinearAttentionTransformerBlock
-            else:
-                transformer_block_klass = Identity
-
-            skip_connect_dim = skip_connect_dims.pop()
-
-            upsample_fmap_dims.append(dim_out)
+            upsample_fmap_dims.append(dim_in)
 
             self.ups.append(nn.ModuleList([
-                resnet_klass(dim_out + skip_connect_dim, dim_out, cond_dim = layer_cond_dim, linear_attn = layer_use_linear_cross_attn, time_cond_dim = time_cond_dim, groups = groups),
-                nn.ModuleList([ResnetBlock(dim_out + skip_connect_dim, dim_out, time_cond_dim = time_cond_dim, groups = groups, use_gca = use_global_context_attn) for _ in range(layer_num_resnet_blocks)]),
-                transformer_block_klass(dim = dim_out, depth = layer_attn_depth, ff_mult = ff_mult, context_dim = cond_dim, **attn_kwargs),
-                upsample_klass(dim_out, dim_in) if not is_last or memory_efficient else Identity()
+                upsample_klass(dim_in, dim_out) if not is_last else None,
+                resnet_klass(dim_out + skip_connect_dim, dim_out, time_cond_dim = time_cond_dim, groups = groups, use_se = use_se_attn, boundary=self.boundary, factor = self.batch_sample_factor) if not is_last else resnet_klass(dim_in, dim_out, time_cond_dim = time_cond_dim, groups = groups, use_se = use_se_attn, boundary=self.boundary, factor = self.batch_sample_factor) ,
+                nn.ModuleList([ResnetBlock(dim_out, dim_out, time_cond_dim = time_cond_dim, groups = groups, use_se = use_se_attn, boundary= self.boundary, factor = self.batch_sample_factor) for _ in range(layer_num_resnet_blocks)]),
             ]))
 
         # whether to combine feature maps from all upsample blocks before final resnet block out
 
-        self.upsample_combiner = UpsampleCombiner(
-            dim = dim,
-            enabled = combine_upsample_fmaps,
-            dim_ins = upsample_fmap_dims,
-            dim_outs = dim
-        )
+        # self.upsample_combiner = UpsampleCombiner(
+        #     dim = dim,
+        #     enabled = combine_upsample_fmaps,
+        #     dim_ins = upsample_fmap_dims,
+        #     dim_outs = dim
+        # )
 
         # whether to do a final residual from initial conv to the final resnet block out
 
         self.init_conv_to_final_conv_residual = init_conv_to_final_conv_residual
-        final_conv_dim = self.upsample_combiner.dim_out + (dim if init_conv_to_final_conv_residual else 0)
+        final_conv_dim = dim_out #self.upsample_combiner.dim_out + (dim if init_conv_to_final_conv_residual else 0)
 
         # final optional resnet block and convolution out
-
-        self.final_res_block = ResnetBlock(final_conv_dim, dim, time_cond_dim = time_cond_dim, groups = resnet_groups[0], use_gca = True) if final_resnet_block else None
+        self.final_res_block = ResnetBlock(final_conv_dim, dim, time_cond_dim = time_cond_dim, groups = resnet_groups[0], use_se = use_se_attn, boundary=self.boundary, factor = self.batch_sample_factor) if final_resnet_block else None
 
         final_conv_dim_in = dim if final_resnet_block else final_conv_dim
-        final_conv_dim_in += (channels if lowres_cond else 0)
 
-        self.final_conv = nn.Conv3d(final_conv_dim_in, self.channels_out, final_conv_kernel_size, padding = final_conv_kernel_size // 2)
-
-        zero_init_(self.final_conv)
-
+        self.final_conv = nn.Conv3d(final_conv_dim_in, self.channels_out, final_conv_kernel_size)
+        
+        
     # if the current settings for the unet are not correct
     # for cascading DDPM, then reinit the unet with the right settings
     def cast_model_parameters(
         self,
         *,
         lowres_cond,
-        text_embed_dim,
         channels,
         channels_out,
-        cond_on_text
     ):
         if lowres_cond == self.lowres_cond and \
             channels == self.channels and \
-            cond_on_text == self.cond_on_text and \
-            text_embed_dim == self._locals['text_embed_dim'] and \
             channels_out == self.channels_out:
             return self
 
         updated_kwargs = dict(
             lowres_cond = lowres_cond,
-            text_embed_dim = text_embed_dim,
             channels = channels,
             channels_out = channels_out,
-            cond_on_text = cond_on_text
         )
 
         return self.__class__(**{**self._locals, **updated_kwargs})
@@ -1259,12 +1554,10 @@ class Unet(nn.Module):
     def forward(
         self,
         x,
+        time_steps,
         time,
         *,
         lowres_cond_img = None,
-        lowres_noise_times = None,
-        text_embeds = None,
-        text_mask = None,
         cond_images = None,
         self_cond = None,
         cond_drop_prob = 0.
@@ -1277,15 +1570,12 @@ class Unet(nn.Module):
             self_cond = default(self_cond, lambda: torch.zeros_like(x))
             x = torch.cat((x, self_cond), dim = 1)
         # add low resolution conditioning, if present
-
         assert not (self.lowres_cond and not exists(lowres_cond_img)), 'low resolution conditioning image must be present'
-        #assert not (self.lowres_cond and not exists(lowres_noise_times)), 'low resolution conditioning noise time must be present'
 
         if exists(lowres_cond_img):
             x = torch.cat((x, lowres_cond_img), dim = 1)
 
         # condition on input image
-
         assert not (self.has_cond_image ^ exists(cond_images)), 'you either requested to condition on an image on the unet, but the conditioning image is not supplied, or vice versa'
 
         if exists(cond_images):
@@ -1294,7 +1584,8 @@ class Unet(nn.Module):
             x = torch.cat((cond_images, x), dim = 1)
 
         # initial convolution
-
+        if self.boundary:
+            x = boundary_pad(x)
         x = self.init_conv(x)
 
         # init conv residual
@@ -1303,85 +1594,79 @@ class Unet(nn.Module):
             init_conv_residual = x.clone()
 
         # time conditioning
-        time_hiddens = self.to_time_hiddens(time)
+        time_hiddens = self.to_time_hiddens(time) #take time vector and convert it to embeddings
         # derive time tokens
-
-        time_tokens = self.to_time_tokens(time_hiddens)
-
-        t = self.to_time_cond(time_hiddens)
-        # add lowres time conditioning to time hiddens
-        # and add lowres time tokens along sequence dimension for attention
-
-#         if self.lowres_cond:
-#             lowres_time_hiddens = self.to_lowres_time_hiddens(lowres_noise_times)
-#             lowres_time_tokens = self.to_lowres_time_tokens(lowres_time_hiddens)
-#             lowres_t = self.to_lowres_time_cond(lowres_time_hiddens)
-
-#             t = t + lowres_t
-#             time_tokens = torch.cat((time_tokens, lowres_time_tokens), dim = -2)
-
-        # text conditioning
-
-        text_tokens = None
-
-        # main conditioning tokens (c)
-
-        c = time_tokens if not exists(text_tokens) else torch.cat((time_tokens, text_tokens), dim = -2)
-
-        # normalize conditioning tokens
-
-        c = self.norm_cond(c)
-
-        # initial resnet block (for memory efficient unet)
-
-        if exists(self.init_resnet_block):
-            x = self.init_resnet_block(x, t)
+        t = self.to_time_cond(time_hiddens) #change channel to same as convolution channel but no of channels same, refer to actual time embedding(?)
 
         # go through the layers of the unet, down and up
-
         hiddens = []
-
-        for pre_downsample, init_block, resnet_blocks, attn_block, post_downsample in self.downs:
+        last = len(self.downs)
+        for i, (pre_downsample, init_block, attn_block, resnet_blocks, post_downsample) in enumerate(self.downs):
             if exists(pre_downsample):
                 x = pre_downsample(x)
 
-            x = init_block(x, t, c)
+            x = init_block(x, t)
+
+            if exists(attn_block):
+                res = x
+
+                B, C, H = x.shape[0], x.shape[1], x.shape[-1]
+                x = merge_sub_volumes(x, original_shape=(1,C,H*self.batch_sample_factor,H*self.batch_sample_factor,H*self.batch_sample_factor))
+                x = attn_block(x)
+                x = convertVolume2subVolume(x, target_shape=(B,C,H,H,H))
+                #assert self.batch_sample, 'batch sample must be true for this to work'
+                #if self.skip_scale:
+                #    scale = torch.clamp((-torch.log(time_steps[0]))**2, max=1.0).to(device)
+                #    x *= scale
+
+                x += res
+
             for resnet_block in resnet_blocks:
                 x = resnet_block(x, t)
+            if i != last - 1:
                 hiddens.append(x)
-
-            x = attn_block(x, c)
-            hiddens.append(x)
-
             if exists(post_downsample):
                 x = post_downsample(x)
 
-        x = self.mid_block1(x, t, c)
+            residual = x
 
-        if exists(self.mid_attn):
-            x = self.mid_attn(x)
+        if self.deep_feature:
+        #x = self.mid_block1(x, t)
+            if exists(self.mid_attn):
+                res = x
 
-        x = self.mid_block2(x, t, c)
+                B, C, H = x.shape[0], x.shape[1], x.shape[-1]
+                x = merge_sub_volumes(x, original_shape=(1,C,H*self.batch_sample_factor,H*self.batch_sample_factor,H*self.batch_sample_factor))
+                x = self.mid_attn(x)
+                x = convertVolume2subVolume(x, target_shape=(B,C,H,H,H))
+            
+                #x2 = self.mid_block1(x, t)
+                #x = torch.cat((x1, x2), dim = 1)
+
+                x = self.mid_block(x, t)
+            else:
+                #x = self.mid_block1(x, t)
+                x = self.mid_block(x, t)
+            #residual connection
+            #x +=residual
 
         add_skip_connection = lambda x: torch.cat((x, hiddens.pop() * self.skip_connect_scale), dim = 1)
 
         up_hiddens = []
 
-        for init_block, resnet_blocks, attn_block, upsample in self.ups:
-            x = add_skip_connection(x)
-            x = init_block(x, t, c)
-
-            for resnet_block in resnet_blocks:
+        for upsample, init_block, resnet_blocks in self.ups:
+            if exists(upsample):
+                x = upsample(x)
                 x = add_skip_connection(x)
+            x = init_block(x, t)
+            for resnet_block in resnet_blocks:
                 x = resnet_block(x, t)
 
-            x = attn_block(x, c)
             up_hiddens.append(x.contiguous())
-            x = upsample(x)
 
         # whether to combine all feature maps from upsample blocks
 
-        x = self.upsample_combiner(x, up_hiddens)
+        #x = self.upsample_combiner(x, up_hiddens)
 
         # final top-most residual if needed
 
@@ -1390,12 +1675,12 @@ class Unet(nn.Module):
 
         if exists(self.final_res_block):
             x = self.final_res_block(x, t)
-
-        if exists(lowres_cond_img):
-            x = torch.cat((x, lowres_cond_img), dim = 1)
+        
+        # if self.boundary:
+        #     x = boundary_pad(x)
 
         out = self.final_conv(x)
-        
+
         return out
 
 # null unet
@@ -1420,8 +1705,6 @@ class BaseUnet64(Unet):
             dim = 512,
             dim_mults = (1, 2, 3, 4),
             num_resnet_blocks = 3,
-            layer_attns = (False, True, True, True),
-            layer_cross_attns = (False, True, True, True),
             attn_heads = 8,
             ff_mult = 2.,
             memory_efficient = False
@@ -1434,8 +1717,6 @@ class SRUnet256(Unet):
             dim = 128,
             dim_mults = (1, 2, 4, 8),
             num_resnet_blocks = (2, 4, 8, 8),
-            layer_attns = (False, False, False, True),
-            layer_cross_attns = (False, False, False, True),
             attn_heads = 8,
             ff_mult = 2.,
             memory_efficient = True
@@ -1448,7 +1729,6 @@ class SRUnet1024(Unet):
             dim = 128,
             dim_mults = (1, 2, 4, 8),
             num_resnet_blocks = (2, 4, 8, 8),
-            layer_attns = False,
             layer_cross_attns = (False, False, False, True),
             attn_heads = 8,
             ff_mult = 2.,
@@ -1462,32 +1742,45 @@ class Imagen(nn.Module):
     def __init__(
         self,
         unets,
+        configs,
         *,
         image_sizes,                                # for cascading ddpm, image size at each stage
-        text_encoder_name = DEFAULT_T5_NAME,
-        text_embed_dim = None,
+        min_bound = 0,
         channels = 3,
         timesteps = 1000,
         cond_drop_prob = 0.1,
         loss_type = 'l2',
         noise_schedules = 'cosine',
         pred_objectives = 'noise',
-        random_crop_sizes = None,
         lowres_noise_schedule = 'linear',
         lowres_sample_noise_level = 0.2,            # in the paper, they present a new trick where they noise the lowres conditioning image, and at sample time, fix it to a certain level (0.1 or 0.3) - the unets are also made to be conditioned on this noise level
         per_sample_random_aug_noise_level = False,  # unclear when conditioning on augmentation noise level, whether each batch element receives a random aug noise value - turning off due to @marunine's find
-        condition_on_text = False,
-        auto_normalize_img = True,                  # whether to take care of normalizing the image from [0, 1] to [-1, 1] and back automatically - you can turn this off if you want to pass in the [-1, 1] ranged image yourself from the dataloader
-        p2_loss_weight_gamma = 0,                 # p2 loss weight, from https://arxiv.org/abs/2204.00227 - 0 is equivalent to weight of 1 across time
+        auto_normalize_img = False,                  # whether to take care of normalizing the image from [0, 1] to [-1, 1] and back automatically - you can turn this off if you want to pass in the [-1, 1] ranged image yourself from the dataloader
+        p2_loss_weight_gamma = 0.5,                 # p2 loss weight, from https://arxiv.org/abs/2204.00227 - 0 is equivalent to weight of 1 across time
         p2_loss_weight_k = 1,
         dynamic_thresholding = True,
         dynamic_thresholding_percentile = 0.95,     # unsure what this was based on perusal of paper
         only_train_unet_number = None,
-        temporal_downsample_factor = 1
+        temporal_downsample_factor = 1,
+        lpips = False,
+        medlpips = False,
+        boundary = False
     ):
         super().__init__()
-
+        
+        self.configs = configs
+        self.medlpips = medlpips
         # loss
+        self.boundary = boundary
+        if lpips:
+            self.lpips = LearnedPerceptualImagePatchSimilarity(net_type='vgg', normalize=True).cuda()
+        else:
+            self.lpips = None
+        if self.medlpips:
+            assert self.medlpips, "MedLPIPIS is current not in use"
+            #self.lpips = MedPercept(resize=False)
+        else:
+            self.lpips = None
 
         if loss_type == 'l1':
             loss_fn = F.l1_loss
@@ -1497,14 +1790,16 @@ class Imagen(nn.Module):
             loss_fn = F.smooth_l1_loss
         else:
             raise NotImplementedError()
-        self.flag = 0##################
         self.loss_type = loss_type
         self.loss_fn = loss_fn
 
+        #Minimum value threshold
+        self.min_bound = min_bound
+
         # conditioning hparams
 
-        self.condition_on_text = condition_on_text
-        self.unconditional = not condition_on_text
+        self.condition_on_text = False
+        self.unconditional = not False
 
         # channels
 
@@ -1535,11 +1830,6 @@ class Imagen(nn.Module):
             noise_scheduler = noise_scheduler_klass(noise_schedule = noise_schedule, timesteps = timestep)
             self.noise_schedulers.append(noise_scheduler)
 
-        # randomly cropping for upsampler training
-
-        self.random_crop_sizes = cast_tuple(random_crop_sizes, num_unets)
-        assert not exists(first(self.random_crop_sizes)), 'you should not need to randomly crop image during training for base unet, only for upsamplers - so pass in `random_crop_sizes = (None, 128, 256)` as example'
-
         # lowres augmentation noise schedule
 
         self.lowres_noise_schedule = GaussianDiffusionContinuousTimes(noise_schedule = lowres_noise_schedule)
@@ -1561,8 +1851,6 @@ class Imagen(nn.Module):
 
             one_unet = one_unet.cast_model_parameters(
                 lowres_cond = not is_first,
-                cond_on_text = self.condition_on_text,
-                text_embed_dim = None,
                 channels = self.channels,
                 channels_out = self.channels
             )
@@ -1577,14 +1865,6 @@ class Imagen(nn.Module):
         assert num_unets == len(image_sizes), f'you did not supply the correct number of u-nets ({len(unets)}) for resolutions {image_sizes}'
 
         self.sample_channels = cast_tuple(self.channels, num_unets)
-
-        # determine whether we are training on images or video
-
-        is_video = any([isinstance(unet, Unet3D) for unet in self.unets])
-        self.is_video = is_video
-
-        self.right_pad_dims_to_datatype = partial(rearrange, pattern = ('b -> b 1 1 1' if not is_video else 'b -> b 1 1 1 1'))
-        self.resize_to = resize_video_to if is_video else resize_image_to
 
         # temporal interpolation
 
@@ -1610,7 +1890,6 @@ class Imagen(nn.Module):
 
         self.normalize_img = normalize_neg_one_to_one if auto_normalize_img else identity
         self.unnormalize_img = unnormalize_zero_to_one if auto_normalize_img else identity
-        self.input_image_range = (0. if auto_normalize_img else -1., 1.)
 
         # dynamic thresholding
 
@@ -1701,12 +1980,9 @@ class Imagen(nn.Module):
         t,
         *,
         noise_scheduler,
-        text_embeds = None,
-        text_mask = None,
         cond_images = None,
         lowres_cond_img = None,
         self_cond = None,
-        lowres_noise_times = None,
         cond_scale = 1.,
         model_output = None,
         t_next = None,
@@ -1715,9 +1991,10 @@ class Imagen(nn.Module):
     ):
         assert not (cond_scale != 1. and not self.can_classifier_guidance), 'imagen was not trained with conditional dropout, and thus one cannot use classifier free guidance (cond_scale anything other than 1)'
 
-        pred = default(model_output, lambda: unet.forward_with_cond_scale(x, noise_scheduler.get_condition(t), text_embeds = text_embeds, text_mask = text_mask, cond_images = cond_images, cond_scale = cond_scale, lowres_cond_img = lowres_cond_img, self_cond = self_cond, lowres_noise_times = None )) 
+        pred = default(model_output, lambda: unet.forward_with_cond_scale(x, t, noise_scheduler.get_condition(t), cond_images = cond_images, cond_scale = cond_scale, lowres_cond_img = lowres_cond_img, self_cond = self_cond)) 
         
         if pred_objective == 'noise':
+            #Calculates prediction x_t-1 from the noise predicted given x_t
             x_start = noise_scheduler.predict_start_from_noise(x, t = t, noise = pred)
         elif pred_objective == 'x_start':
             x_start = pred
@@ -1725,22 +2002,30 @@ class Imagen(nn.Module):
             x_start = noise_scheduler.predict_start_from_v(x, t = t, v = pred)
         else:
             raise ValueError(f'unknown objective {pred_objective}')
+        
+        if dynamic_threshold:      
 
-        if dynamic_threshold:
             # following pseudocode in appendix
             # s is the dynamic threshold, determined by percentile of absolute values of reconstructed sample per batch element
             s = torch.quantile(
-                rearrange(x_start, 'b ... -> b (...)').abs(),
-                self.dynamic_thresholding_percentile,
-                dim = -1
+               rearrange(x_start, 'b ... -> b (...)').abs(),
+               self.dynamic_thresholding_percentile,
+               dim = -1
             )
-
-            s.clamp_(min = 1.)
+            
+            if self.configs['Data']['norm'] == 'min-max':
+                s.clamp_(min=1.)
+            else:
+                s.clamp_(min = self.min_bound) #1.)
             s = right_pad_dims_to(x_start, s)
-            x_start = x_start.clamp(-s, s) / s
+            x_start =  x_start.clamp(-s, s) / s
         else:
-            x_start.clamp_(-1., 1.)
-
+            if self.configs['Data']['norm'] == 'min-max':
+                x_start.clamp_(-1., 1.)
+            else:
+                x_start.clamp_(min = self.min_bound)#(-1., 1.)
+        
+        #Deduce mean and variance
         mean_and_variance = noise_scheduler.q_posterior(x_start = x_start, x_t = x, t = t, t_next = t_next)
         return mean_and_variance, x_start
 
@@ -1753,26 +2038,22 @@ class Imagen(nn.Module):
         *,
         noise_scheduler,
         t_next = None,
-        text_embeds = None,
-        text_mask = None,
         cond_images = None,
         cond_scale = 1.,
         self_cond = None,
         lowres_cond_img = None,
-        lowres_noise_times = None,
         pred_objective = 'noise',
         dynamic_threshold = True
     ):
         b, *_, device = *x.shape, x.device
-#         plt.imshow(lowres_cond_img.cpu()[0][0], cmap='gray')
-#         plt.show()
-        (model_mean, _, model_log_variance), x_start = self.p_mean_variance(unet, x = x, t = t, t_next = t_next, noise_scheduler = noise_scheduler, text_embeds = text_embeds, text_mask = text_mask, cond_images = cond_images, cond_scale = cond_scale, lowres_cond_img = lowres_cond_img, self_cond = self_cond, lowres_noise_times = lowres_noise_times, pred_objective = pred_objective, dynamic_threshold = dynamic_threshold)
+
+        (model_mean, _, model_log_variance), x_start = self.p_mean_variance(unet, x = x, t = t, t_next = t_next, noise_scheduler = noise_scheduler, cond_images = cond_images, cond_scale = cond_scale, lowres_cond_img = lowres_cond_img, self_cond = self_cond, pred_objective = pred_objective, dynamic_threshold = dynamic_threshold)
         noise = torch.randn_like(x)
-        # no noise when t == 0
+        # no noise when t == 0, if t_next = 0 then nonzero mask is 0 hence pred = model_mean. 
         is_last_sampling_timestep = (t_next == 0) if isinstance(noise_scheduler, GaussianDiffusionContinuousTimes) else (t == 0)
         nonzero_mask = (1 - is_last_sampling_timestep.float()).reshape(b, *((1,) * (len(x.shape) - 1)))
-        pred = model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
-        return pred, x_start
+        pred = model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise #q_sampled images
+        return pred, x_start #q_sampled images, predicted x_start
 
     @torch.no_grad()
     def p_sample_loop(
@@ -1782,9 +2063,6 @@ class Imagen(nn.Module):
         *,
         noise_scheduler,
         lowres_cond_img = None,
-        lowres_noise_times = None,
-        text_embeds = None,
-        text_mask = None,
         cond_images = None,
         inpaint_images = None,
         inpaint_masks = None,
@@ -1801,12 +2079,6 @@ class Imagen(nn.Module):
         batch = shape[0]
         img = torch.randn(shape, device = device)
 
-        # video
-
-        is_video = len(shape) == 5
-        frames = shape[-3] if is_video else None
-        resize_kwargs = dict(target_frames = frames) if exists(frames) else dict()
-
         # for initialization with an image or video
 
         if exists(init_images):
@@ -1821,24 +2093,24 @@ class Imagen(nn.Module):
         has_inpainting = exists(inpaint_images) and exists(inpaint_masks)
         resample_times = inpaint_resample_times if has_inpainting else 1
 
-        if has_inpainting:
-            inpaint_images = self.normalize_img(inpaint_images)
-            inpaint_images = self.resize_to(inpaint_images, shape[-1], **resize_kwargs)
-            inpaint_masks = self.resize_to(rearrange(inpaint_masks, 'b ... -> b 1 ...').float(), shape[-1]).bool()
-
         # time
 
+        #timesteps = noise_scheduler.get_sampling_timesteps_non_uniform(batch, device = device)
         timesteps = noise_scheduler.get_sampling_timesteps(batch, device = device)
 
         # whether to skip any steps
 
         skip_steps = default(skip_steps, 0)
-        timesteps = timesteps[skip_steps:]
-        
-        lst = []
+        #timesteps = tuple(list(timesteps)[::skip_steps]) #timesteps[skip_steps:]
+        if skip_steps > 1:
+            timesteps = list(timesteps)[::skip_steps] + [list(timesteps)[-1]]
+            timesteps = tuple(timesteps)        
+
+        noisy_pred_img = []
+        pred_img = []
         cnt = 0
 
-        for times, times_next in tqdm(timesteps, desc = 'sampling loop time step', total = len(timesteps), disable = use_tqdm):
+        for times, times_next in tqdm(timesteps, desc = 'sampling loop time step', total = len(timesteps), disable = not use_tqdm):
             is_last_timestep = times_next == 0
 
             for r in reversed(range(resample_times)):
@@ -1855,13 +2127,10 @@ class Imagen(nn.Module):
                     img,
                     times,
                     t_next = times_next,
-                    text_embeds = text_embeds,
-                    text_mask = text_mask,
                     cond_images = cond_images,
                     cond_scale = cond_scale,
                     self_cond = self_cond,
                     lowres_cond_img = lowres_cond_img,
-                    lowres_noise_times = lowres_noise_times,
                     noise_scheduler = noise_scheduler,
                     pred_objective = pred_objective,
                     dynamic_threshold = dynamic_threshold
@@ -1875,26 +2144,26 @@ class Imagen(nn.Module):
                         img,
                         renoised_img
                     )
-            if cnt % 10 == 0:
-                lst.append(img)
+            if cnt % 1 == 0:
+                noisy_pred_img.append(img.cpu().numpy())
+                pred_img.append(x_start.cpu().numpy())
+            cnt+=1
         
-        lst.append(img)
-        img.clamp_(-1., 1.)
-
-        # final inpainting
-
-        if has_inpainting:
-            img = img * ~inpaint_masks + inpaint_images * inpaint_masks
+        noisy_pred_img.append(img.cpu().numpy())
+        pred_img.append(x_start.cpu().numpy())
+        if self.configs['Data']['norm'] == 'min-max':
+            img.clamp_(-1.,1.)
+        else:
+            img.clamp_(min = self.min_bound) #-1., 1.)
 
         unnormalize_img = self.unnormalize_img(img)
-        return unnormalize_img, lst
+        return unnormalize_img, noisy_pred_img, pred_img
 
     @torch.no_grad()
     @eval_decorator
     @beartype
     def sample(
         self,
-        texts: List[str] = None,
         text_masks = None,
         text_embeds = None,
         video_frames = None,
@@ -1910,7 +2179,7 @@ class Imagen(nn.Module):
         start_at_unet_number = 1,
         start_image_or_video = None, #lowres_imgae input
         stop_at_unet_number = None,
-        return_all_unet_outputs = False,
+        return_all_outputs = False,
         return_pil_images = False,
         device = None,
         use_tqdm = True
@@ -1926,16 +2195,6 @@ class Imagen(nn.Module):
             text_masks = default(text_masks, lambda: torch.any(text_embeds != 0., dim = -1))
             batch_size = text_embeds.shape[0]
 
-        if exists(inpaint_images):
-            if self.unconditional:
-                if batch_size == 1: # assume researcher wants to broadcast along inpainted images
-                    batch_size = inpaint_images.shape[0]
-
-            assert inpaint_images.shape[0] == batch_size, 'number of inpainting images must be equal to the specified batch size on sample `sample(batch_size=<int>)``'
-            assert not (self.condition_on_text and inpaint_images.shape[0] != text_embeds.shape[0]), 'number of inpainting images must be equal to the number of text to be conditioned on'
-
-        assert not (exists(inpaint_images) ^ exists(inpaint_masks)),  'inpaint images and masks must be both passed in to do inpainting'
-
         outputs = []
 
         is_cuda = next(self.parameters()).is_cuda
@@ -1949,18 +2208,10 @@ class Imagen(nn.Module):
 
         cond_scale = cast_tuple(cond_scale, num_unets)
 
-        # add frame dimension for video
-
-        assert not (self.is_video and not exists(video_frames)), 'video_frames must be passed in on sample time if training on video'
-
-        all_frame_dims = calc_all_frame_dims(self.temporal_downsample_factor, video_frames)
-
-        frames_to_resize_kwargs = lambda frames: dict(target_frames = frames) if exists(frames) else dict()
-
         # for initial image and skipping steps
 
         init_images = cast_tuple(init_images, num_unets)
-        init_images = [maybe(self.normalize_img)(init_image) for init_image in init_images]
+        init_images = [init_image for init_image in init_images]
 
         skip_steps = cast_tuple(skip_steps, num_unets)
 
@@ -1971,14 +2222,11 @@ class Imagen(nn.Module):
             assert not exists(stop_at_unet_number) or start_at_unet_number <= stop_at_unet_number
             assert exists(start_image_or_video), 'starting image or video must be supplied if only doing upscaling'
 
-            prev_image_size = self.image_sizes[start_at_unet_number - 2]
-            prev_frame_size = all_frame_dims[start_at_unet_number - 2][0] if self.is_video else None
             img = start_image_or_video
-            #img = self.resize_to(start_image_or_video, prev_image_size, **frames_to_resize_kwargs(prev_frame_size))
 
         # go through each unet in cascade
 
-        for unet_number, unet, channel, image_size, frame_dims, noise_scheduler, pred_objective, dynamic_threshold, unet_cond_scale, unet_init_images, unet_skip_steps in tqdm(zip(range(1, num_unets + 1), self.unets, self.sample_channels, self.image_sizes, all_frame_dims, self.noise_schedulers, self.pred_objectives, self.dynamic_thresholding, cond_scale, init_images, skip_steps), disable = not use_tqdm):
+        for unet_number, unet, channel, image_size, noise_scheduler, pred_objective, dynamic_threshold, unet_cond_scale, unet_init_images, unet_skip_steps in tqdm(zip(range(1, num_unets + 1), self.unets, self.sample_channels, self.image_sizes, self.noise_schedulers, self.pred_objectives, self.dynamic_thresholding, cond_scale, init_images, skip_steps), disable = not use_tqdm):
 
             if unet_number < start_at_unet_number:
                 continue
@@ -1988,32 +2236,17 @@ class Imagen(nn.Module):
             context = self.one_unet_in_gpu(unet = unet) if is_cuda else nullcontext()
 
             with context:
-                lowres_cond_img = lowres_noise_times = None
-                shape = (batch_size, channel, *frame_dims, image_size, image_size)
-
-                resize_kwargs = dict(target_frames = frame_dims[0]) if self.is_video else dict()
+                lowres_cond_img = None
+                shape = (batch_size, channel, image_size, image_size)
 
                 if unet.lowres_cond:
-                    lowres_noise_times = None #self.lowres_noise_schedule.get_times(batch_size, lowres_sample_noise_level, device = device)
+                    lowres_cond_img = img 
 
-                    lowres_cond_img = img #self.resize_to(img, image_size, **resize_kwargs)
-
-                    lowres_cond_img = self.normalize_img(lowres_cond_img)
-#                     lowres_cond_img, *_ = self.lowres_noise_schedule.q_sample(x_start = lowres_cond_img, t = lowres_noise_times, noise = torch.randn_like(lowres_cond_img))
-
-                if exists(unet_init_images):
-                    unet_init_images = self.resize_to(unet_init_images, image_size, **resize_kwargs)
-
-                shape = (batch_size, self.channels, *frame_dims, image_size, image_size, image_size)
+                shape = (batch_size, self.channels, image_size, image_size, image_size)
                 
-#                 print("LOW res img: ", lowres_cond_img.shape)
-#                 plt.imshow(lowres_cond_img[0][0].cpu(),cmap='gray')
-#                 plt.show()
-                img, lst = self.p_sample_loop(
+                img, lst_pred_noisy, lst_pred = self.p_sample_loop(
                     unet,
                     shape,
-                    text_embeds = text_embeds,
-                    text_mask = text_masks,
                     cond_images = cond_images,
                     inpaint_images = inpaint_images,
                     inpaint_masks = inpaint_masks,
@@ -2022,7 +2255,6 @@ class Imagen(nn.Module):
                     skip_steps = unet_skip_steps,
                     cond_scale = unet_cond_scale,
                     lowres_cond_img = lowres_cond_img,
-                    lowres_noise_times = None,
                     noise_scheduler = noise_scheduler,
                     pred_objective = pred_objective,
                     dynamic_threshold = dynamic_threshold,
@@ -2034,20 +2266,12 @@ class Imagen(nn.Module):
             if exists(stop_at_unet_number) and stop_at_unet_number == unet_number:
                 break
 
-        output_index = -1 if not return_all_unet_outputs else slice(None) # either return last unet output or all unet outputs
+        output_index = -1 if not return_all_outputs else slice(None) # either return last unet output or all unet outputs
 
-        if not return_pil_images:
-            return outputs[output_index]
+        # if not return_pil_images:
+        #     return outputs[output_index]
 
-        if not return_all_unet_outputs:
-            outputs = outputs[-1:]
-
-        assert not self.is_video, 'converting sampled video tensor to video file is not supported yet'
-
-        #pil_images = list(map(lambda img: list(map(T.ToPILImage(), img.unbind(dim = 0))), outputs))
-
-        #return pil_images[output_index], outputs, lst # now you have a bunch of pillow images you can just .save(/where/ever/you/want.png)
-        return outputs[output_index], lst
+        return outputs[output_index], lst_pred_noisy, lst_pred
 
     @beartype
     def p_losses(
@@ -2058,57 +2282,26 @@ class Imagen(nn.Module):
         *,
         noise_scheduler,
         lowres_cond_img = None,
-        lowres_aug_times = None,
-        text_embeds = None,
-        text_mask = None,
         cond_images = None,
         noise = None,
-        times_next = None,
         pred_objective = 'noise',
         p2_loss_weight_gamma = 0.,
-        random_crop_size = None,
         **kwargs
     ):
-        is_video = x_start.ndim == 5
 
         noise = default(noise, lambda: torch.randn_like(x_start))
 
         # normalize to [-1, 1]
-
         x_start = self.normalize_img(x_start)
         lowres_cond_img = maybe(self.normalize_img)(lowres_cond_img)
 
-        # random cropping during training
-        # for upsamplers
-
-        if exists(random_crop_size):
-            if is_video:
-                frames = x_start.shape[2]
-                x_start, lowres_cond_img, noise = rearrange_many((x_start, lowres_cond_img, noise), 'b c f h w d -> (b f) c h w d')
-
-            aug = K.RandomCrop((random_crop_size, random_crop_size), p = 1.)
-
-            # make sure low res conditioner and image both get augmented the same way
-            # detailed https://kornia.readthedocs.io/en/latest/augmentation.module.html?highlight=randomcrop#kornia.augmentation.RandomCrop
-            x_start = aug(x_start)
-            lowres_cond_img = aug(lowres_cond_img, params = aug._params)
-            noise = aug(noise, params = aug._params)
-
-            if is_video:
-                x_start, lowres_cond_img, noise = rearrange_many((x_start, lowres_cond_img, noise), '(b f) c h w d -> b c f h w d', f = frames)
-
         # get x_t
-
         x_noisy, log_snr, alpha, sigma = noise_scheduler.q_sample(x_start = x_start, t = times, noise = noise)
 
         # also noise the lowres conditioning image
         # at sample time, they then fix the noise level of 0.1 - 0.3
-
         lowres_cond_img_noisy = None
         lowres_cond_img_noisy = lowres_cond_img
-#         if exists(lowres_cond_img):
-#             lowres_aug_times = default(lowres_aug_times, times)
-#             lowres_cond_img_noisy, *_ = self.lowres_noise_schedule.q_sample(x_start = lowres_cond_img, t = lowres_aug_times, noise = torch.randn_like(lowres_cond_img))
 
         # time condition
         noise_cond = noise_scheduler.get_condition(times)
@@ -2116,10 +2309,7 @@ class Imagen(nn.Module):
         # unet kwargs
 
         unet_kwargs = dict(
-            text_embeds = text_embeds,
-            text_mask = text_mask,
             cond_images = cond_images,
-            lowres_noise_times = None,#self.lowres_noise_schedule.get_condition(lowres_aug_times),
             lowres_cond_img = lowres_cond_img_noisy,
             cond_drop_prob = self.cond_drop_prob,
             **kwargs
@@ -2148,6 +2338,7 @@ class Imagen(nn.Module):
         # get prediction
         pred = unet.forward(
             x_noisy,
+            times, 
             noise_cond,
             **unet_kwargs
         )
@@ -2166,26 +2357,34 @@ class Imagen(nn.Module):
         else:
             raise ValueError(f'unknown objective {pred_objective}')
         
-        with open('./results/pred'+'.npy', 'wb') as f:
-            np.save(f, pred.cpu().detach().numpy())
-        with open('./results/hr'+'.npy', 'wb') as f:
-            np.save(f, x_start.cpu().numpy())
-        with open('./results/target'+'.npy', 'wb') as f:
-            np.save(f, target.cpu().numpy())
-
-        self.flag+=1
         # losses
-
-        losses = self.loss_fn(pred, target, reduction = 'mean')
-        #losses = reduce(losses, 'b ... -> b', 'mean')
-
+        if pred_objective == 'x_start':
+            pred.clamp_(min = self.min_bound)
+        losses = self.loss_fn(pred, target, reduction = 'none')
+        losses = reduce(losses, 'b ... -> b', 'mean')
+        
         # p2 loss reweighting
 
         if p2_loss_weight_gamma > 0:
             loss_weight = (self.p2_loss_weight_k + log_snr.exp()) ** -p2_loss_weight_gamma
             losses = losses * loss_weight
 
-        return losses.mean()
+        if self.lpips:
+            if self.medlpips:
+                per_ls = self.lpips(pred, target)
+            else:
+                pred_rgb = volume_to_slices(pred)
+                target_rgb = volume_to_slices(target)
+
+                # pred_rgb = (pred_rgb - pred_rgb.min())/(pred_rgb.max() - pred_rgb.min())
+                # target_rgb = (target_rgb - target_rgb.min())/(target_rgb.max() - target_rgb.min())
+
+                per_ls = self.lpips(pred_rgb, target_rgb)
+
+
+            return losses.mean() + 0.1*per_ls.mean(), pred, x_noisy, lowres_cond_img_noisy
+
+        return losses.mean(), pred, x_noisy, lowres_cond_img_noisy
 
     @beartype
     def forward(
@@ -2193,17 +2392,12 @@ class Imagen(nn.Module):
         images, # rename to images or video
         lowres_img = None,
         unet: Union[Unet, Unet3D, NullUnet, DistributedDataParallel] = None,
-        texts: List[str] = None,
         text_embeds = None,
         text_masks = None,
         unet_number = None,
         cond_images = None,
-        validation = False,
         **kwargs
     ):
-        if self.is_video and images.ndim == 4:
-            images = rearrange(images, 'b c h w d -> b c 1 h w d')
-            kwargs.update(ignore_time = True)
 
         assert images.shape[-1] == images.shape[-2], f'the images you pass in must be a square, but received dimensions of {images.shape[2]}, {images.shape[-1]}'
         assert not (len(self.unets) > 1 and not exists(unet_number)), f'you must specify which unet you want trained, from a range of 1 to {len(self.unets)}, if you are training cascading DDPM (multiple unets)'
@@ -2225,33 +2419,24 @@ class Imagen(nn.Module):
         p2_loss_weight_gamma = self.p2_loss_weight_gamma[unet_index]
         pred_objective       = self.pred_objectives[unet_index]
         target_image_size    = self.image_sizes[unet_index]
-        random_crop_size     = self.random_crop_sizes[unet_index]
-        prev_image_size      = self.image_sizes[unet_index - 1] if unet_index > 0 else None
         
-        b, c, *_, h, w, d, device, is_video = *images.shape, images.device, images.ndim == 5
+        b, c, *_, h, w, d, device = *images.shape, images.device
 
-        check_shape(images, 'b c ...', c = self.channels)
+        check_shape(images, 'b c h w d', c = self.channels)
         assert h >= target_image_size and w >= target_image_size
-
-        frames              = images.shape[2] if is_video else None
-        all_frame_dims      = tuple(safe_get_tuple_index(el, 0) for el in calc_all_frame_dims(self.temporal_downsample_factor, frames))
-        ignore_time         = kwargs.get('ignore_time', False)
-
-        target_frame_size   = all_frame_dims[unet_index] if is_video and not ignore_time else None
-        prev_frame_size     = all_frame_dims[unet_index - 1] if is_video and not ignore_time and unet_index > 0 else None
-        frames_to_resize_kwargs = lambda frames: dict(target_frames = frames) if exists(frames) else dict()
         
-        if not validation:
-            times = noise_scheduler.sample_random_times(b, device = device)
+        if self.configs['Train']['batch_sample']:
+            times = noise_scheduler.sample_random_times(1, device = device)
+            times = times.repeat(b)
         else:
             times = noise_scheduler.sample_random_times(b, device = device)
 
         if not self.unconditional:
             text_masks = default(text_masks, lambda: torch.any(text_embeds != 0., dim = -1))
 
-        lowres_cond_img = lowres_aug_times = None
+        lowres_cond_img = None
         assert lowres_img is not None, 'lowres image must be provided'
         lowres_cond_img = lowres_img
         self.lowres_cond_img = lowres_cond_img
         
-        return self.p_losses(unet, images, times, text_embeds = text_embeds, text_mask = text_masks, cond_images = cond_images, noise_scheduler = noise_scheduler, lowres_cond_img = lowres_cond_img, lowres_aug_times = lowres_aug_times, pred_objective = pred_objective, p2_loss_weight_gamma = p2_loss_weight_gamma, random_crop_size = random_crop_size, **kwargs)
+        return self.p_losses(unet, images, times, cond_images = cond_images, noise_scheduler = noise_scheduler, lowres_cond_img = lowres_cond_img, pred_objective = pred_objective, p2_loss_weight_gamma = p2_loss_weight_gamma, **kwargs)

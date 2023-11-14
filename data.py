@@ -41,21 +41,31 @@ def convert_image_to(img_type, image):
 
 def my_collate(batch):
     batch = list(filter(lambda x : x is not None, batch))
+
+    if batch == []:
+        return None
+    
     return default_collate(batch)
 
 class supervisedIQT(Dataset):
-    def __init__(self, lr_files, hr_files, fake=False, train=True):
+    def __init__(self, config, lr_files, hr_files, train=True):
+        self.config = config
         self.lr_files = lr_files
         self.hr_files = hr_files
-        self.patch_size = 32
-        self.fake = fake
-        self.ratio = 0.7
-        self.total_voxel = self.patch_size * self.patch_size * self.patch_size
-        self.train = train
-        self.is_transform = True
 
-        self.mean_lr = 35.493949511348724
-        self.std_lr = 37.11344433531084
+        self.mean_lr = self.config['Data']['mean']#202.68109075616067 #35.493949511348724
+        self.std_lr = self.config['Data']['std']#346.51374798642223 #37.11344433531084
+
+        if self.config['Train']['batch_sample']:
+            self.patch_size = self.config['Train']['patch_size_sub'] * self.config['Train']['batch_sample_factor']
+        else:
+            self.patch_size = self.config['Train']['patch_size_sub']
+        self.train = train
+        if self.train:
+            self.ratio = 0.2
+        else:
+            self.ratio = 0.8
+
         self.files_lr = []
         self.files_hr = []
         
@@ -66,11 +76,98 @@ class supervisedIQT(Dataset):
     def __len__(self):
         return len(self.files_lr)
 
-    def transform(self, image): # transform 3D array to tensor
+    def normalize(self, img, mode='lr'): # transform 3D array to tensor
+
+        if self.config['Data']['norm'] == 'min-max':
+            return 2*(((img-img.min())/(img.max()-img.min()))-0.5)
+        return (img - self.mean_lr)/self.std_lr
+    
+    def cube(self,data):
+
+        hyp_norm = data
+
+        if len(hyp_norm.shape)>3:
+            hyp_norm = hyp_norm[:,:, 2:258, 27:283]
+        else:
+            hyp_norm = hyp_norm[2:258, 27:283, :256]
+
+        return hyp_norm
+
+    def __getitem__(self, idx):
         
-        image_torch = torch.FloatTensor(image)
+        self.lr = self.files_lr[idx]
+        self.hr = self.lr.replace('lr_norm',self.config['Data']['groundtruth_fname'])#'T1w_acpc_dc_restore_brain')   #'T1w_acpc_dc_restore_brain_sim036T_4x_groundtruth_norm')
+        
+        self.lr = nib.load(self.lr)
+        self.lr_affine = self.lr.affine
+        self.lr = torch.tensor(self.lr.get_fdata().astype(np.float32))
+        self.img_shape = self.lr.shape
+        self.hr = nib.load(self.hr)
+        self.hr_affine = self.hr.affine
+        self.hr = torch.tensor(self.hr.get_fdata().astype(np.float32))
+        
+        #Cube
+        low, high = 0, 256 #16, 240 
+        
+        assert self.lr.shape == (256,256,256), f'lr must be 256 256 256 but got {self.lr.shape}'
+        assert self.hr.shape == (256,256,256), f'hr must be 256 256 256 but got {self.hr.shape}'
+
+        self.lr = self.lr[low:high,low:high,low:high]
+        self.hr = self.hr[low:high,low:high,low:high] 
+
+        random_idx = np.random.randint(low=0, high=(high-low)-self.patch_size, size=3)
+        self.lr = self.lr[random_idx[0]:random_idx[0]+self.patch_size, random_idx[1]:random_idx[1]+self.patch_size, random_idx[2]:random_idx[2]+self.patch_size]
+        self.hr = self.hr[random_idx[0]:random_idx[0]+self.patch_size, random_idx[1]:random_idx[1]+self.patch_size, random_idx[2]:random_idx[2]+self.patch_size]
+	
+        non_zero = np.count_nonzero(self.lr)
+        self.total_voxel = self.patch_size * self.patch_size * self.patch_size
+        non_zero_proportion = (non_zero/self.total_voxel)
+        if (non_zero_proportion < self.ratio):
+            return self.__getitem__(idx)
+                            
+        self.lr = self.normalize(self.lr, mode='lr')
+        self.hr = self.normalize(self.hr, mode='hr')
+            
+        sample_lr = torch.unsqueeze(self.lr, 0)
+        sample_hr = torch.unsqueeze(self.hr, 0)
+        
+        if self.train:
+            return sample_hr, sample_lr
+        else:    
+            return sample_hr, sample_lr
+        
+class supervisedIQT_INF(Dataset):
+    def __init__(self, config, lr_file):
+        self.lr_file = lr_file
+        self.config = config
+
+        self.mean_lr = self.config['Data']['mean']#202.68109075616067 #35.493949511348724
+        self.std_lr = self.config['Data']['std']#346.51374798642223 #37.11344433531084
+
+        if self.config['Train']['batch_sample']:
+            self.patch_size = self.config['Train']['patch_size_sub'] * self.config['Train']['batch_sample_factor']
+        else:
+            self.patch_size = self.config['Train']['patch_size_sub']
+        self.overlap = self.config['Eval']['overlap']
+
+        self.ratio = 0.05
+        self.total_voxel = self.patch_size * self.patch_size * self.patch_size
+
+        self.lr_idx = []
+        low, high = 0, 256
+        self.lr_data = nib.load(self.lr_file).get_fdata()[low:high,low:high,low:high]
+        for i in range(0,self.lr_data.shape[0]-self.patch_size+1,self.overlap):
+            for j in range(0,self.lr_data.shape[1]-self.patch_size+1,self.overlap):
+                for k in range(0,self.lr_data.shape[2]-self.patch_size+1,self.overlap):
+                    self.lr_idx.append([i,j,k])
+
+    def __len__(self):
+        return len(self.lr_idx)
+
+    def normalize(self, img): # transform 3D array to tensor
+
+        image_torch = torch.FloatTensor(img)
         image_torch = (image_torch - self.mean_lr)/self.std_lr
-        
         return image_torch
     
     def cube(self,data):
@@ -86,52 +183,26 @@ class supervisedIQT(Dataset):
 
     def __getitem__(self, idx):
         
-        if self.fake:
-            self.lr = np.load(self.files_lr[idx])
-            self.hr = np.load(self.files_lr[idx].replace('lr','hr'))
-            self.lr = self.transform(self.lr)
-            self.hr = self.transform(self.hr)
-                
-            sample_lr = torch.unsqueeze(self.lr, 0)
-            sample_hr = torch.unsqueeze(self.hr, 0)
-            return sample_hr, sample_lr
-        self.lr = self.files_lr[idx]
-        self.hr = self.lr.replace('lr_norm','T1w_acpc_dc_restore_brain_sim036T_4x_groundtruth_norm')
+        self.lr = self.lr_idx[idx]
         
-        self.lr = nib.load(self.lr)
-        self.lr_affine = self.lr.affine
-        self.lr = torch.tensor(self.lr.get_fdata().astype(np.float32))
+        self.lr = self.lr_data[self.lr[0]:self.lr[0]+self.patch_size, self.lr[1]:self.lr[1]+self.patch_size, self.lr[2]:self.lr[2]+self.patch_size]
+        self.lr = torch.tensor(self.lr.astype(np.float32))
         self.img_shape = self.lr.shape
-        self.hr = nib.load(self.hr)
-        self.hr_affine = self.hr.affine
-        self.hr = torch.tensor(self.hr.get_fdata().astype(np.float32))
-        
-        #Cube 
-        self.lr = self.cube(self.lr)
-        self.hr = self.cube(self.hr)
             
-        random_idx = np.random.randint(low=0, high=256-self.patch_size+1, size=3)
-        self.lr = self.lr[random_idx[0]:random_idx[0]+self.patch_size, random_idx[1]:random_idx[1]+self.patch_size, random_idx[2]:random_idx[2]+self.patch_size]
-        self.hr = self.hr[random_idx[0]:random_idx[0]+self.patch_size, random_idx[1]:random_idx[1]+self.patch_size, random_idx[2]:random_idx[2]+self.patch_size]
-
         non_zero = np.count_nonzero(self.lr)
         non_zero_proportion = (non_zero/self.total_voxel)
+        
         if (non_zero_proportion < self.ratio):
-            return self.__getitem__(idx)
-                     
-        self.lr = self.transform(self.lr)
-        self.hr = self.transform(self.hr)
+            return None 
+                            
+        self.lr = self.normalize(self.lr)
             
         sample_lr = torch.unsqueeze(self.lr, 0)
-        sample_hr = torch.unsqueeze(self.hr, 0)
         
-        if self.train:
-            #fname = self.files_lr[idx].split('/')[6]
-            return sample_hr, sample_lr#, 'Index': idx, 'Affine': self.hr_affine}
-        else:
-            #fname = self.files_lr[idx].split('/')[7]
-            return sample_hr, sample_lr#, 'Index': idx, 'Affine': self.hr_affine}
-        
+        return [sample_lr, torch.tensor(self.lr_idx[idx])]
+
+
+
 class IQTDataset(Dataset):
     def __init__(
         self,

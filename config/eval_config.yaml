@@ -1,4 +1,4 @@
-ProjectName: 'CompleteBase_96_8x_2/'
+ProjectName: 'App_96_8x' #'LinearTransCNN_96_8x/'
 Model: 'model/'  
 File: 'train_log/'
 Results: './results/'
@@ -6,24 +6,24 @@ Results: './results/'
 Data:
   groundtruth_path: '/cluster/project0/IQT_Nigeria/skim/HCP_Harry_x8/train_large/*/T1w/T1w_acpc_dc_restore_brain.nii.gz' #'/cluster/project0/IQT_Nigeria/skim/HCP_Harry_x4/train/*/T1w/*_groundtruth_norm.nii.gz'
   lowres_path: '/cluster/project0/IQT_Nigeria/skim/HCP_Harry_x8/train_large/*/T1w/lr_norm*.gz'
-  groundtruth_path_test: '/cluster/project0/IQT_Nigeria/skim/HCP_Harry_x8/valid/*/T1w/T1w_acpc_dc_restore_brain.nii.gz' #'/cluster/project0/IQT_Nigeria/skim/HCP_Harry_x4/valid/*/T1w/*_groundtruth_norm.nii.gz'
-  lowres_path_test: '/cluster/project0/IQT_Nigeria/skim/HCP_Harry_x8/valid/*/T1w/lr_norm*.gz'
+  groundtruth_path_test: '/cluster/project0/IQT_Nigeria/skim/HCP_Harry_x8/test_small_ood/*/T1w/T1w_acpc_dc_restore_brain.nii.gz' #'/cluster/project0/IQT_Nigeria/skim/HCP_Harry_x4/valid/*/T1w/*_groundtruth_norm.nii.gz'
+  lowres_path_test: '/cluster/project0/IQT_Nigeria/skim/HCP_Harry_x8/test_small_ood/*/T1w/lr_norm*.gz'
   groundtruth_fname: 'T1w_acpc_dc_restore_brain' 
-  mean: 271.64814106698583 
-  std: 377.117173547721 
-  mean_hr: 259.3117656881453 
-  std_hr: 362.1817760568698 
+  mean: 271.64814106698583 #196.9671147052807
+  std: 377.117173547721 #339.58505584763907
+  mean_hr: 259.3117656881453 #188.29690981419
+  std_hr: 362.1817760568698 #326.2159236155404
   norm: 'z-score' #min-max
 
 Train:
-  pretrain: True
+  pretrain: False
   pred_obj: 'x_start'
-  timesteps: 1000
-  batch_sample: False #if True, extracts 96x96x96 then convert to 27x32x32x32
+  timesteps: 20
+  batch_sample: True #if True, extracts 96x96x96 then convert to 27x32x32x32
   batch_sample_factor: 3
   lpips: False
   medlpips: False
-  boundary: False
+  boundary: True
   att_type: 'linear'
   att_mid: False
   att_head_dim: 64 
@@ -41,7 +41,7 @@ Train:
   emb_size: 256
   efficient: False
   patch_size_sub: 32
-  pretrain_model: '/cluster/project0/IQT_Nigeria/skim/diffusion/results/CompleteBase_96_8x/model/3dimagen.pt'
+  pretrain_model: '/cluster/project0/IQT_Nigeria/skim/diffusion/results/Baseline_96_8x/model/3dimagen.pt'
   batch_size: 27
   save_file: 'train_loss.csv'
   save_model: '3dimagen.pt'
@@ -53,7 +53,7 @@ Train:
 Eval:
   batch_size: 27
   repeat: 5
-  overlap: 48
+  overlap: 32
   save_file: 'valid_loss.csv'
   save_file2: 'valid_loss_full.csv'
   save_imgs: 'figures/'

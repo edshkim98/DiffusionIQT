@@ -18,6 +18,7 @@ from torch.cuda.amp import autocast, GradScaler
 import pytorch_warmup as warmup
 
 from imagen_pytorch3D import Imagen, NullUnet
+from utils_mine import convertVolume2subVolume, merge_sub_volumes
 from elucidated_imagen import ElucidatedImagen
 from data import cycle
 
@@ -37,6 +38,8 @@ from fsspec.implementations.local import LocalFileSystem
 import torchvision.transforms.functional as TF
 import torchvision.transforms as T
 import torch.nn.functional as F
+
+from metrics import SSIM, MSSIM, PSNR
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -235,6 +238,7 @@ class ImagenTrainer(nn.Module):
 
     def __init__(
         self,
+        configs,
         imagen = None,
         imagen_checkpoint_path = None,
         use_ema = True,
@@ -260,7 +264,7 @@ class ImagenTrainer(nn.Module):
         checkpoint_fs = None,
         fs_kwargs: dict = None,
         max_checkpoints_keep = 20,
-        gradient_accumulation_steps = 16,
+        gradient_accumulation_steps = 4,
         **kwargs
     ):
         super().__init__()
@@ -268,7 +272,7 @@ class ImagenTrainer(nn.Module):
         assert exists(imagen) ^ exists(imagen_checkpoint_path), 'either imagen instance is passed into the trainer, or a checkpoint path that contains the imagen config'
 
         # determine filesystem, using fsspec, for saving to local filesystem or cloud
-
+        self.configs = configs
         self.fs = checkpoint_fs
 
         if not exists(self.fs):
@@ -309,8 +313,9 @@ class ImagenTrainer(nn.Module):
         # imagen, unets and ema unets
 
         self.imagen = imagen
+        
         self.num_unets = len(self.imagen.unets)
-
+        
         self.use_ema = use_ema and self.is_main
         self.ema_unets = nn.ModuleList([])
 
@@ -339,27 +344,29 @@ class ImagenTrainer(nn.Module):
 
         # be able to finely customize learning rate, weight decay
         # per unet
-
+        
         lr, eps, warmup_steps, cosine_decay_max_steps = map(partial(cast_tuple, length = self.num_unets), (lr, eps, warmup_steps, cosine_decay_max_steps))
-
+        
         for ind, (unet, unet_lr, unet_eps, unet_warmup_steps, unet_cosine_decay_max_steps) in enumerate(zip(self.imagen.unets, lr, eps, warmup_steps, cosine_decay_max_steps)):
+            
             optimizer = Adam(
                 unet.parameters(),
                 lr = unet_lr,
                 eps = unet_eps,
                 betas = (beta1, beta2),
+                #weight_decay  = 1e-4,
                 **kwargs
             )
-
+            
             if self.use_ema:
                 self.ema_unets.append(EMA(unet, **ema_kwargs))
-
+            
             scaler = GradScaler(enabled = grad_scaler_enabled)
-
+            
             scheduler = warmup_scheduler = None
 
             if exists(unet_cosine_decay_max_steps):
-                scheduler = CosineAnnealingLR(optimizer, T_max = unet_cosine_decay_max_steps, eta_min = lr*0.01)
+                scheduler = CosineAnnealingLR(optimizer, T_max = unet_cosine_decay_max_steps, eta_min = lr[1]*0.001)
 
             if exists(unet_warmup_steps):
                 warmup_scheduler = warmup.LinearWarmup(optimizer, warmup_period = unet_warmup_steps)
@@ -368,7 +375,7 @@ class ImagenTrainer(nn.Module):
                     scheduler = LambdaLR(optimizer, lr_lambda = lambda step: 1.0)
 
             # set on object
-
+            
             setattr(self, f'optim{ind}', optimizer) # cannot use pytorch ModuleList for some reason with optimizers
             setattr(self, f'scaler{ind}', scaler)
             setattr(self, f'scheduler{ind}', scheduler)
@@ -379,16 +386,17 @@ class ImagenTrainer(nn.Module):
         self.max_grad_norm = max_grad_norm
 
         # step tracker and misc
-
+        
         self.register_buffer('steps', torch.tensor([0] * self.num_unets))
-
+        
         self.verbose = verbose
 
         # automatic set devices based on what accelerator decided
-
+        
         self.imagen.to(self.device)
+        
         self.to(self.device)
-
+        
         # checkpointing
 
         assert not (exists(checkpoint_path) ^ exists(checkpoint_every))
@@ -405,12 +413,12 @@ class ImagenTrainer(nn.Module):
                 self.fs.mkdir(bucket)
 
             self.load_from_checkpoint_folder()
-
+        
         # only allowing training for unet
 
         self.only_train_unet_number = only_train_unet_number
         self.prepared = False
-
+        
         #Validation image save initial flag
         self.valid_images_save = False
     def prepare(self):
@@ -605,17 +613,23 @@ class ImagenTrainer(nn.Module):
         self.valid_dl_iter = cycle(self.valid_dl)
 
     def train_step(self, unet_number = None, **kwargs):
+
+        self.training = True
+
         if not self.prepared:
             self.prepare()
 
         self.create_train_iter()
         loss = self.step_with_dl_iter(self.train_dl, unet_number = unet_number, **kwargs)
-            
+        
         return loss
 
     @torch.no_grad()
     @eval_decorator
-    def valid_step(self, **kwargs):
+    def valid_step2(self, unet_number=None,**kwargs):
+
+        self.training = False
+
         if not self.prepared:
             self.prepare()
         self.create_valid_iter()
@@ -623,31 +637,132 @@ class ImagenTrainer(nn.Module):
         preds = []
         hrs = []
         lrs = []
-        repeat = 20
+        ssims = []
+        psnrs = []
+        repeat = self.configs['Eval']['repeat']
         context = self.use_ema_unets if kwargs.pop('use_ema_unets', False) else nullcontext
         with context():
-            # np.random.seed(42)
+            np.random.seed(42)
+            torch.manual_seed(42)
             for rep in range(repeat):
                 for i, data in enumerate(self.valid_dl):
-                    outputs = self.sample(batch_size = self.valid_batch_size, return_all_unet_outputs = True, return_pil_images = False, start_image_or_video = data[1].to(device), start_at_unet_number = 2)
-                    loss = F.l1_loss(data[0], outputs[0].cpu())
-                    hrs.append(data[0].cpu())
-                    lrs.append(data[1].cpu())
+                    lr = data[1]
+                    if self.configs['Train']['batch_sample']:
+                        
+                        new_batch = (data[0].shape[-1]//self.configs['Train']['patch_size_sub'])**3
+                        c,h = data[0].shape[1], self.configs['Train']['patch_size_sub']
+                        gt = convertVolume2subVolume(data[0], target_shape=(new_batch,c,h,h,h))
+                        lr = convertVolume2subVolume(lr, target_shape=(new_batch,c,h,h,h))
+                        
+                        self.valid_batch_size = gt.shape[0]
+                    else:
+                        gt = data[0]
+
+                    outputs = self.sample(batch_size = self.valid_batch_size, return_all_unet_outputs = True, return_pil_images = False, start_image_or_video = lr.to(device), start_at_unet_number = unet_number)                    
+                    out = outputs[0].cpu()
+                    
+                    loss = F.l1_loss(gt, out)
+                    
+                    #out[np.where(mask==-1)] = -1
+                    ssim = SSIM(out, gt)
+                    psnr = PSNR(out, gt)
+                    
+                    hrs.append(gt.cpu())
+                    lrs.append(lr.cpu())
                     preds.append(outputs[0].cpu())
                     ls.append(loss)
+                    ssims.append(ssim)
+                    psnrs.append(psnr)
+                    
         hrs = np.concatenate(hrs)
         lrs = np.concatenate(lrs)
         preds = np.concatenate(preds)
-        return np.array(ls), preds, [hrs,lrs]
+        ssim = np.mean(np.array(ssims))
+        psnr = np.mean(np.array(psnrs))
+        
+        return np.array(ls), preds, [hrs,lrs], ssim, psnr
+
+    @torch.no_grad()
+    @eval_decorator
+    def valid_step(self, unet_number = None, **kwargs):
+
+        self.training = False
+
+        if not self.prepared:
+            self.prepare()
+            
+        self.create_valid_iter()
+        context = self.use_ema_unets if kwargs.pop('use_ema_unets', False) else nullcontext
+
+        ls = []
+        with context():
+            np.random.seed(42)
+            torch.manual_seed(42)
+            loss, preds, condi1, condi2, hrs, ssim, psnr = self.step_with_dl_iter(self.valid_dl, unet_number = unet_number, **kwargs)    
+            
+        return loss, preds, condi1, [hrs, condi2], ssim, psnr
 
     def step_with_dl_iter(self, dl_iter, **kwargs):
         #dl_tuple_output = cast_tuple(next(dl_iter))
         self.total_loss = 0.
-        for i, data in enumerate(dl_iter):
-            model_input = dict(list(zip(self.dl_tuple_output_keywords_names, data)))
-            loss = self.forward(**{**kwargs, **model_input})
-        loss = loss/len(dl_iter)
-        return loss
+        if self.training:
+            self.repeat = 1 
+        else:
+            self.repeat= self.configs['Eval']['repeat']
+            preds = []
+            condi1 = []
+            condi2 = []
+            hrs = []
+            ssims = []
+            psnrs = []
+
+        for r in range(self.repeat):
+            for i, data in enumerate(dl_iter):
+                hr_data=data[0]
+                lr_data=data[1]
+
+                if self.configs['Train']['batch_sample']:
+                    new_batch = (hr_data.shape[-1]//self.configs['Train']['patch_size_sub'])**3
+                    c,h = hr_data.shape[1], self.configs['Train']['patch_size_sub']
+                    hr_data = convertVolume2subVolume(hr_data, target_shape=(new_batch,c,h,h,h))
+                    lr_data = convertVolume2subVolume(lr_data, target_shape=(new_batch,c,h,h,h))
+
+                    # assert lr_data.shape[0] == new_batch, f'batch size is incorrect. Must be {new_batch} but got {lr_data.shape[0]}'
+                model_input = dict(list(zip(self.dl_tuple_output_keywords_names, (hr_data, lr_data))))
+                loss, pred, x_noisy, lowres_cond_img_noisy = self.forward(**{**kwargs, **model_input})
+                if not self.training:
+                    if self.configs['Train']['batch_sample']:
+                        pred_merge = merge_sub_volumes(pred)
+                        hr_data_merge = merge_sub_volumes(hr_data)
+                    else:
+                        pred_merge = pred
+                        hr_data_merge = hr_data
+                    if self.configs['Train']['pred_obj'] == 'x_start':
+                        ssim = SSIM(pred_merge.cpu(), hr_data_merge.cpu()).numpy()
+                        psnr = PSNR(pred_merge.cpu(), hr_data_merge.cpu()).numpy()
+                        ssims.append(ssim)
+                        psnrs.append(psnr)
+                    if r < 2:
+                        preds.append(pred.cpu().numpy())
+                        condi1.append(x_noisy.cpu().numpy())
+                        condi2.append(lowres_cond_img_noisy.cpu().numpy())
+                        hrs.append(hr_data.cpu().numpy())
+
+                self.total_loss += loss
+            
+        loss = self.total_loss/(len(dl_iter)*self.repeat)
+
+        if self.training:
+            return loss
+        else:
+            preds = np.concatenate(preds)
+            condi1 = np.concatenate(condi1)
+            condi2 = np.concatenate(condi2)
+            hrs = np.concatenate(hrs)
+            ssims = np.mean(np.array(ssims))
+            psnrs = np.mean(np.array(psnrs))
+
+            return loss, preds, condi1, condi2, hrs, ssims, psnrs
 
     # checkpointing functions
 
@@ -975,7 +1090,7 @@ class ImagenTrainer(nn.Module):
 
         if not self.is_main:
             kwargs['use_tqdm'] = False
-
+        kwargs['use_tqdm'] = False
         with context():
             output = self.imagen.sample(*args, device = self.device, **kwargs)
 
@@ -995,17 +1110,19 @@ class ImagenTrainer(nn.Module):
         self.max_batch_size = max_batch_size
 
         assert not exists(self.only_train_unet_number) or self.only_train_unet_number == unet_number, f'you can only train unet #{self.only_train_unet_number}'
+        
+        total_loss = 0.
 
         for chunk_size_frac, (chunked_args, chunked_kwargs) in split_args_and_kwargs(*args, split_size = max_batch_size, **kwargs):
             with self.accelerator.autocast():
                 with self.accelerator.accumulate(self.unet_being_trained):
-                    loss = self.imagen(*chunked_args, unet = self.unet_being_trained, unet_number = unet_number, **chunked_kwargs)
+                    loss, pred, x_noisy, lowres_cond_img_noisy = self.imagen(*chunked_args, unet = self.unet_being_trained, unet_number = unet_number, **chunked_kwargs)
                     loss = loss * chunk_size_frac
                     
                     if self.training:
                         self.accelerator.backward(loss)
                         self.update(unet_number = unet_number)
 
-            self.total_loss += loss.item()
+            total_loss += loss.item()
 
-        return self.total_loss
+        return total_loss, pred, x_noisy, lowres_cond_img_noisy
