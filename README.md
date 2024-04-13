@@ -11,12 +11,10 @@ Code still under developement, please wait :)
 
 To cite my paper: <br />
 ```
-@misc{kim20233d,
-      title={A 3D Conditional Diffusion Model for Image Quality Transfer -- An Application to Low-Field MRI}, 
-      author={Seunghoi Kim and Henry F. J. Tregidgo and Ahmed K. Eldaly and Matteo Figini and Daniel C. Alexander},
-      year={2023},
-      eprint={2311.06631},
-      archivePrefix={arXiv},
-      primaryClass={eess.IV}
+@article{kim20233d,
+  title={A 3D Conditional Diffusion Model for Image Quality Transfer--An Application to Low-Field MRI},
+  author={Kim, Seunghoi and Tregidgo, Henry FJ and Eldaly, Ahmed K and Figini, Matteo and Alexander, Daniel C},
+  journal={arXiv preprint arXiv:2311.06631},
+  year={2023}
 }
 ```
