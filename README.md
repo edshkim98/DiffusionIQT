@@ -11,10 +11,9 @@ Code still under developement, please wait :)
 
 To cite my paper: <br />
 ```
-@article{kim20233d,
-  title={A 3D Conditional Diffusion Model for Image Quality Transfer--An Application to Low-Field MRI},
-  author={Kim, Seunghoi and Tregidgo, Henry FJ and Eldaly, Ahmed K and Figini, Matteo and Alexander, Daniel C},
-  journal={arXiv preprint arXiv:2311.06631},
-  year={2023}
+@inproceedings{kim20233d,
+  title={A 3D Conditional Diffusion Model for Image Quality Transfer-An Application to Low-Field MRI},
+  author={Kim, Seunghoi and Alexander, Daniel C and Eldaly, Ahmed Karam and Figini, Matteo and Tregidgo, Henry FJ},
+  booktitle={Deep Generative Models for Health Workshop NeurIPS 2023}
 }
 ```
